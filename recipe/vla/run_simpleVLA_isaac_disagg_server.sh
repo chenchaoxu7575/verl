@@ -22,19 +22,17 @@ NUM_NODES=1
 SIM_NODES=1
 NUM_ENV_GPUS=8
 NUM_ROLLOUT_GPUS=8
-#NUM_ROLLOUT_GPUS=2
 STAGE_NUM=2
 BATCH_SIZE=16
-#BATCH_SIZE=4
 # rollout.n should equal to num_envs for isaac env
 ROLLOUT_N=8
 SERVER_GROUP_SIZE=16
 
 # 512 is required for libero benchmark, but you can reduce it in debugging to run faster
-MAX_EPISODE_STEPS=128
+MAX_EPISODE_STEPS=512
 
 # isaac or libero
-# libero means original libero benchmark with mujoco sim
+# NOT SUPPORTED: libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
 SIM_TYPE=${SIM_TYPE:-"isaac"}
 PROJECT_NAME="vla-disagg-isaac-server"
@@ -46,24 +44,26 @@ EXPERIMENT_NAME="${SIM_TYPE}_server_rl"
 USE_SERVER_MODE=True
 
 # Number of Isaac servers per group (one per GPU)
-NUM_ISAAC_SERVERS=${NUM_ISAAC_SERVERS:-8}
+NUM_ISAAC_SERVERS=8
 
 # Number of server groups - MUST match STAGE_NUM (pipeline_stage_num)
 # Each pipeline stage uses its own server group for physical isolation
 # This enables Gen-Sim parallel execution and prevents env state interference
-NUM_SERVER_GROUPS=${NUM_SERVER_GROUPS:-$STAGE_NUM}
+NUM_SERVER_GROUPS=$STAGE_NUM
 
 # Server address configuration
 # Isaac Server runs on SIM_NODE, Client runs on TRAIN_NODE
-SIM_NODE_IP=${SIM_NODE_IP:-"10.185.189.15"}
-ISAAC_SERVER_ADDRESS=${ISAAC_SERVER_ADDRESS:-"tcp://${SIM_NODE_IP}"}
-ISAAC_SERVER_USE_TCP=${ISAAC_SERVER_USE_TCP:-True}
+SIM_NODE_IP="10.185.189.15"
+ISAAC_SERVER_ADDRESS="tcp://${SIM_NODE_IP}"
+ISAAC_SERVER_USE_TCP=True
 
 # Base ports for each server group (auto-generated with 50-port spacing)
 # Example with NUM_SERVER_GROUPS=2: [5556, 5606]
 # Server group 0 (Stage 0): ports 5556-5563
 # Server group 1 (Stage 1): ports 5606-5613
-SERVER_BASE_PORTS="[$(seq -s, 5556 50 $((5556 + (NUM_SERVER_GROUPS-1) * 50)))]"
+BASE_PORT=5556
+PORT_SPACING=50
+SERVER_BASE_PORTS="[$(seq -s, $BASE_PORT $PORT_SPACING $((BASE_PORT + (NUM_SERVER_GROUPS-1) * PORT_SPACING)))]"
 
 # Calculate required envs on server:
 # total_envs = NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N
@@ -92,7 +92,9 @@ fi
 mkdir -p /root/LIBERO/libero/libero/../datasets
 
 export PYTHONRECURSIONLIMIT=10000
-export HYDRA_FULL_ERROR=1
+# uncomment this to see full error messages
+# export HYDRA_FULL_ERROR=1
+
 $PYTHON -m recipe.vla.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -159,7 +161,7 @@ $PYTHON -m recipe.vla.main_ppo \
     trainer.test_freq=-1 \
     trainer.total_epochs=20 \
     trainer.val_only=False \
-    trainer.total_training_steps=5 \
+    trainer.total_training_steps=1000 \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
