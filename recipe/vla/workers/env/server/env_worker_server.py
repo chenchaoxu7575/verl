@@ -66,7 +66,7 @@ import torch
 from omegaconf import DictConfig
 from torch.distributed.device_mesh import init_device_mesh
 
-from recipe.vla.envs.action_utils import prepare_actions, save_rollout_video, tile_images
+from recipe.vla.envs.action_utils import prepare_actions, put_info_on_image, save_rollout_video, tile_images
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -76,16 +76,6 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from .isaac_client import IsaacMultiServerClient
 
 logger = logging.getLogger(__name__)
-
-
-def put_tensor_cpu(data_dict):
-    """Recursively move tensors to CPU."""
-    for key, value in data_dict.items():
-        if isinstance(value, dict):
-            data_dict[key] = put_tensor_cpu(value)
-        if isinstance(value, torch.Tensor):
-            data_dict[key] = value.cpu().contiguous()
-    return data_dict
 
 
 def extract_images_and_states(obs):
@@ -327,8 +317,8 @@ class EnvWorkerServer(Worker):
         trajectory_keys = data.non_tensor_batch.get("trajectory_keys", None)
 
         if trajectory_keys is not None:
-            # Hash-key based validation and env_indices lookup
-            env_indices = self._validate_and_get_env_indices(trajectory_keys)
+            # Validate trajectory_keys exist in registry
+            self._validate_trajectory_keys(trajectory_keys)
         else:
             # Fallback: use active keys in order (for backward compatibility)
             # Actions should be in the same order as reset
@@ -341,7 +331,7 @@ class EnvWorkerServer(Worker):
             stage_start = stage_id * self.num_envs
             stage_end = (stage_id + 1) * self.num_envs
             trajectory_keys = self._active_trajectory_keys[stage_start:stage_end]
-            env_indices = self._validate_and_get_env_indices(trajectory_keys)
+            self._validate_trajectory_keys(trajectory_keys)
 
         # Prepare actions
         chunk_actions = prepare_actions(
@@ -360,7 +350,7 @@ class EnvWorkerServer(Worker):
         max_steps = data.meta_info.get("max_steps", 1)
 
         # Route to stage-specific server group
-        response = self._server_group_step(chunk_actions, trajectory_keys, env_indices, stage_id, step_idx, max_steps)
+        response = self._server_group_step(chunk_actions, trajectory_keys, stage_id, step_idx, max_steps)
 
         if response is None or response.get("status") != "ok":
             raise RuntimeError(f"[rank={self.rank}] Step request failed: {response}")
@@ -404,20 +394,42 @@ class EnvWorkerServer(Worker):
                     self.camera_view = images_and_states["camera_name"]
 
                 full_images = images_and_states["full_image"]  # [N, H, W, C]
+                rewards = response.get("rewards", np.zeros(len(trajectory_keys)))
+                terminations = response.get("terminations", np.zeros(len(trajectory_keys)))
 
                 # Group images by stage_id and task_id
-                stage_id = data.meta_info.get("stage_id", 0)
                 if stage_id not in self.render_images:
                     self.render_images[stage_id] = {}
                     self.video_cnt[stage_id] = {}
 
-                # Group images by task_id within this stage
+                # Group images by task_id within this stage, with info overlay
                 task_id_to_images = {}
                 for i, key in enumerate(trajectory_keys):
                     task_id = self._trajectory_registry[key]["task_id"]
+                    img = full_images[i]
+                    
+                    # Add info overlay (like IsaacEnv.add_new_frames)
+                    # Handle chunk rewards: take last step or mean
+                    if len(rewards.shape) > 1:
+                        reward_val = float(rewards[i, -1])  # Last chunk step
+                    else:
+                        reward_val = float(rewards[i])
+                    
+                    if len(terminations.shape) > 1:
+                        term_val = bool(terminations[i, -1])
+                    else:
+                        term_val = bool(terminations[i])
+                    
+                    plot_info = {
+                        "reward": reward_val,
+                        "done": term_val,
+                        "task": task_id,
+                    }
+                    img = put_info_on_image(img, plot_info)
+                    
                     if task_id not in task_id_to_images:
                         task_id_to_images[task_id] = []
-                    task_id_to_images[task_id].append(full_images[i])
+                    task_id_to_images[task_id].append(img)
 
                 # Tile and store images for each task_id
                 for task_id, task_images in task_id_to_images.items():
@@ -426,7 +438,7 @@ class EnvWorkerServer(Worker):
                         self.video_cnt[stage_id][task_id] = 0
 
                     nrows = int(np.ceil(np.sqrt(len(task_images))))
-                    tiled = tile_images([img for img in task_images], nrows=nrows)
+                    tiled = tile_images(task_images, nrows=nrows)
                     self.render_images[stage_id][task_id].append(tiled)
 
         return env_batch
@@ -435,10 +447,10 @@ class EnvWorkerServer(Worker):
         self,
         chunk_actions: np.ndarray,
         trajectory_keys: list,
-        env_indices: list,
         stage_id: int,
         step_idx: int = 0,
         max_steps: int = 1,
+        render_last_only: bool = True,
     ) -> dict:
         """
         Execute step on the stage-specific server group.
@@ -452,11 +464,11 @@ class EnvWorkerServer(Worker):
 
         Args:
             chunk_actions: Actions array [N, ...]
-            trajectory_keys: List of hash_keys
-            env_indices: List of local env indices
+            trajectory_keys: List of hash_keys (used to look up env_indices from registry)
             stage_id: Pipeline stage ID (determines which server group to use)
             step_idx: Current step index (for logging)
             max_steps: Total number of steps (for logging)
+            render_last_only: If True, only render the last step of the action chunk
 
         Returns:
             Aggregated response dict with obs, rewards, terminations, truncations, infos
@@ -492,7 +504,10 @@ class EnvWorkerServer(Worker):
 
         # === Phase 3: Send requests to stage-specific server group ===
         # Key difference: pass stage_id to route to correct server group
-        responses = self.client.step_batched(server_requests, stage_id=stage_id)
+        # render_last_only: only render the last step of the action chunk for efficiency
+        responses = self.client.step_batched(
+            server_requests, stage_id=stage_id, render_last_only=render_last_only
+        )
 
         # Validate responses
         all_responses = {}
@@ -506,7 +521,7 @@ class EnvWorkerServer(Worker):
                 "original_positions": position_map[rank],
             }
 
-        # === Phase 4: Aggregate responses (same as _distributed_step) ===
+        # === Phase 4: Aggregate responses ===
         num_envs = len(trajectory_keys)
         first_response = next(iter(all_responses.values()))["response"]
         rewards_shape = first_response["rewards"].shape[1:] if len(first_response["rewards"].shape) > 1 else ()
@@ -560,155 +575,19 @@ class EnvWorkerServer(Worker):
             "infos": {},
         }
 
-    def _distributed_step(
-        self, chunk_actions: np.ndarray, trajectory_keys: list, env_indices: list, step_idx: int = 0, max_steps: int = 1
-    ) -> dict:
+    def _validate_trajectory_keys(self, trajectory_keys: list[str]) -> None:
         """
-        Execute step across multiple distributed servers CONCURRENTLY.
-
-        Flow:
-        1. Group actions by server_rank (merge actions destined for same server)
-        2. Send all requests concurrently via client.step_batched()
-        3. Aggregate responses in original order
-
-        Args:
-            chunk_actions: Actions array [N, ...]
-            trajectory_keys: List of hash_keys
-            env_indices: List of local env indices (one per trajectory_key)
-            step_idx: Current step index (for logging)
-            max_steps: Total number of steps (for logging)
-
-        Returns:
-            Aggregated response dict with obs, rewards, terminations, truncations, infos
-        """
-        from collections import defaultdict
-
-        # === Phase 1: Group by server_rank (merge actions for same server) ===
-        server_groups = defaultdict(lambda: {"indices": [], "actions": [], "original_positions": []})
-
-        for i, key in enumerate(trajectory_keys):
-            info = self._trajectory_registry[key]
-            server_rank = info["server_rank"]
-            server_groups[server_rank]["indices"].append(info["env_index"])
-            server_groups[server_rank]["actions"].append(chunk_actions[i])
-            server_groups[server_rank]["original_positions"].append(i)
-
-        # Log distributed step info with progress
-        server_summary = {rank: len(group["indices"]) for rank, group in server_groups.items()}
-        print(
-            f"[EnvWorker] Step {step_idx + 1}/{max_steps}: "
-            f"{len(trajectory_keys)} envs -> {len(server_groups)} servers {server_summary}",
-            flush=True,
-        )
-
-        # === Phase 2: Build batched requests (one per server) ===
-        server_requests = {}
-        position_map = {}  # rank -> original_positions
-        for rank, group in server_groups.items():
-            actions = np.array(group["actions"])
-            indices = group["indices"]
-            server_requests[rank] = (actions, indices)
-            position_map[rank] = group["original_positions"]
-
-        # === Phase 3: Send all requests concurrently ===
-        responses = self.client.step_batched(server_requests)
-
-        # Validate responses
-        all_responses = {}
-        for rank, response in responses.items():
-            if response is None or response.get("status") != "ok":
-                raise RuntimeError(f"[rank={self.rank}] Step request to server {rank} failed: {response}")
-            all_responses[rank] = {
-                "response": response,
-                "original_positions": position_map[rank],
-            }
-
-        # Aggregate responses in original order
-        num_envs = len(trajectory_keys)
-
-        # Determine shapes from first response
-        first_response = next(iter(all_responses.values()))["response"]
-        rewards_shape = first_response["rewards"].shape[1:] if len(first_response["rewards"].shape) > 1 else ()
-        term_shape = first_response["terminations"].shape[1:] if len(first_response["terminations"].shape) > 1 else ()
-
-        # Initialize aggregated arrays
-        aggregated_rewards = np.zeros((num_envs,) + rewards_shape, dtype=first_response["rewards"].dtype)
-        aggregated_terminations = np.zeros((num_envs,) + term_shape, dtype=first_response["terminations"].dtype)
-        aggregated_truncations = np.zeros((num_envs,) + term_shape, dtype=first_response["truncations"].dtype)
-
-        # Aggregate observations (need to handle dict structure)
-        aggregated_obs = {}
-        first_obs = first_response["obs"]
-
-        def init_aggregated_obs(obs_dict, num_envs):
-            result = {}
-            for key, value in obs_dict.items():
-                if isinstance(value, dict):
-                    result[key] = init_aggregated_obs(value, num_envs)
-                elif isinstance(value, np.ndarray):
-                    result[key] = np.zeros((num_envs,) + value.shape[1:], dtype=value.dtype)
-                else:
-                    result[key] = [None] * num_envs
-            return result
-
-        aggregated_obs = init_aggregated_obs(first_obs, num_envs)
-
-        def fill_aggregated_obs(agg_obs, response_obs, positions):
-            for key, value in response_obs.items():
-                if isinstance(value, dict):
-                    fill_aggregated_obs(agg_obs[key], value, positions)
-                elif isinstance(value, np.ndarray):
-                    for i, pos in enumerate(positions):
-                        agg_obs[key][pos] = value[i]
-                else:
-                    for i, pos in enumerate(positions):
-                        agg_obs[key][pos] = value[i] if hasattr(value, "__getitem__") else value
-
-        # Fill in responses
-        for server_rank, data in all_responses.items():
-            response = data["response"]
-            positions = data["original_positions"]
-
-            for i, pos in enumerate(positions):
-                aggregated_rewards[pos] = response["rewards"][i]
-                aggregated_terminations[pos] = response["terminations"][i]
-                aggregated_truncations[pos] = response["truncations"][i]
-
-            fill_aggregated_obs(aggregated_obs, response["obs"], positions)
-
-        return {
-            "status": "ok",
-            "obs": aggregated_obs,
-            "rewards": aggregated_rewards,
-            "terminations": aggregated_terminations,
-            "truncations": aggregated_truncations,
-            "infos": {},  # Simplified - infos aggregation can be added if needed
-        }
-
-    def _validate_and_get_env_indices(self, trajectory_keys: list[str]) -> list[int]:
-        """
-        Validate trajectory_keys and return corresponding env_indices.
+        Validate that all trajectory_keys exist in the registry.
 
         Each trajectory_key uniquely identifies one env. One env produces one trajectory.
 
         Args:
             trajectory_keys: List of hash_keys to validate (one key per env/trajectory)
 
-        Returns:
-            List of env_indices corresponding to the trajectory_keys (one index per env)
-
         Raises:
             RuntimeError if any hash_key is invalid
         """
-        all_env_indices = []
-        invalid_keys = []
-
-        for key in trajectory_keys:
-            if key not in self._trajectory_registry:
-                invalid_keys.append(key)
-            else:
-                # Each key now maps to a single env_index (not a list)
-                all_env_indices.append(self._trajectory_registry[key]["env_index"])
+        invalid_keys = [key for key in trajectory_keys if key not in self._trajectory_registry]
 
         if invalid_keys:
             suffix = "..." if len(invalid_keys) > 5 else ""
@@ -716,8 +595,6 @@ class EnvWorkerServer(Worker):
                 f"[rank={self.rank}] Invalid trajectory_keys: {invalid_keys[:5]}{suffix}. "
                 f"Valid keys: {list(self._trajectory_registry.keys())[:5]}..."
             )
-
-        return all_env_indices
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_all_state_ids(self):
@@ -962,7 +839,7 @@ class EnvWorkerServer(Worker):
                     cnt = self.video_cnt.get(stage_id, {}).get(task_id, 0)
                     video_name = f"rollout_{cnt:04d}_{self.camera_view}"
 
-                    save_rollout_video(frames, output_dir, video_name, fps=10)
+                    save_rollout_video(frames, output_dir, video_name)
 
                     # Increment counter
                     self.video_cnt[stage_id][task_id] = cnt + 1
