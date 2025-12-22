@@ -118,6 +118,7 @@ class IsaacMultiTaskServer:
         port: int = 5555,
         use_ipc: bool = True,
         distributed: bool = False,
+        render_last_only: bool = True,
     ):
         """
         Initialize the Isaac server.
@@ -129,11 +130,13 @@ class IsaacMultiTaskServer:
             port: ZMQ port number (base port in distributed mode)
             use_ipc: If True, use Unix IPC socket; otherwise use TCP
             distributed: If True, enable multi-GPU distributed mode via torchrun
+            render_last_only: If True, only render on the last step of action chunks (saves GPU)
         """
         self.env_id = env_id
         self.group_size = group_size
         self.use_ipc = use_ipc
         self.distributed = distributed
+        self.render_last_only = render_last_only
 
         # Distributed mode settings
         if distributed:
@@ -439,7 +442,23 @@ class IsaacMultiTaskServer:
         chunk_terminations = []
         chunk_truncations = []
 
+        # Save original render_interval to restore later
+        original_render_interval = None
+        if self.render_last_only and hasattr(self.env.unwrapped, "cfg"):
+            original_render_interval = self.env.unwrapped.cfg.sim.render_interval
+
         for chunk_idx in range(num_chunks):
+            is_last_chunk = chunk_idx == num_chunks - 1
+
+            # Control rendering: disable for intermediate steps, enable for last step
+            if self.render_last_only and original_render_interval is not None:
+                if is_last_chunk:
+                    # Restore original render_interval for the last step
+                    self.env.unwrapped.cfg.sim.render_interval = original_render_interval
+                else:
+                    # Disable rendering for intermediate steps (set to a large value)
+                    self.env.unwrapped.cfg.sim.render_interval = 999999
+
             # Get actions for this chunk
             actions = chunk_actions[:, chunk_idx, :]  # [num_envs, action_dim]
 
@@ -454,6 +473,10 @@ class IsaacMultiTaskServer:
             chunk_rewards.append(rewards[env_indices].cpu().numpy())
             chunk_terminations.append(terminations[env_indices].cpu().numpy())
             chunk_truncations.append(truncations[env_indices].cpu().numpy())
+
+        # Restore original render_interval after all chunks
+        if self.render_last_only and original_render_interval is not None:
+            self.env.unwrapped.cfg.sim.render_interval = original_render_interval
 
         # Stack chunk results: [num_envs, num_chunks]
         stacked_rewards = np.stack(chunk_rewards, axis=1)
@@ -657,6 +680,11 @@ def main():
     parser.add_argument(
         "--distributed", action="store_true", help="Enable multi-GPU distributed mode (use with torchrun)"
     )
+    parser.add_argument(
+        "--no_render_last_only",
+        action="store_true",
+        help="Disable render_last_only optimization (render every step of action chunks)",
+    )
 
     args = parser.parse_args()
 
@@ -701,6 +729,7 @@ def main():
         port=args.port,
         use_ipc=not args.use_tcp,
         distributed=args.distributed,
+        render_last_only=not args.no_render_last_only,
     )
 
     server.start()
