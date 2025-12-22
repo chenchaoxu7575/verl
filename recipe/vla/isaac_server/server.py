@@ -119,6 +119,8 @@ class IsaacMultiTaskServer:
         use_ipc: bool = True,
         distributed: bool = False,
         render_last_only: bool = True,
+        camera_height: int = 256,
+        camera_width: int = 256,
     ):
         """
         Initialize the Isaac server.
@@ -131,12 +133,16 @@ class IsaacMultiTaskServer:
             use_ipc: If True, use Unix IPC socket; otherwise use TCP
             distributed: If True, enable multi-GPU distributed mode via torchrun
             render_last_only: If True, only render on the last step of action chunks (saves GPU)
+            camera_height: Camera image height (default: 256)
+            camera_width: Camera image width (default: 256)
         """
         self.env_id = env_id
         self.group_size = group_size
         self.use_ipc = use_ipc
         self.distributed = distributed
         self.render_last_only = render_last_only
+        self.camera_height = camera_height
+        self.camera_width = camera_width
 
         # Distributed mode settings
         if distributed:
@@ -243,6 +249,15 @@ class IsaacMultiTaskServer:
 
         # Parse environment config - this will use our GROUP_SIZE env var
         env_cfg = parse_env_cfg(self.env_id, device=self.device, num_envs=self.total_envs)
+
+        # Override camera dimensions if the config supports it
+        if hasattr(env_cfg, "camera_height"):
+            env_cfg.camera_height = self.camera_height
+            env_cfg.camera_width = self.camera_width
+            env_cfg.recreate_cameras()
+            logger.info(
+                f"[Rank {self.local_rank}] Set camera dimensions: {self.camera_width}x{self.camera_height}"
+            )
 
         # In distributed mode, we need to adjust the task configuration
         # Each server only handles a subset of tasks
@@ -683,6 +698,8 @@ def main():
         action="store_true",
         help="Disable render_last_only optimization (render every step of action chunks)",
     )
+    parser.add_argument("--camera_height", type=int, default=256, help="Camera image height")
+    parser.add_argument("--camera_width", type=int, default=256, help="Camera image width")
 
     args = parser.parse_args()
 
@@ -728,6 +745,8 @@ def main():
         use_ipc=not args.use_tcp,
         distributed=args.distributed,
         render_last_only=not args.no_render_last_only,
+        camera_height=args.camera_height,
+        camera_width=args.camera_width,
     )
 
     server.start()

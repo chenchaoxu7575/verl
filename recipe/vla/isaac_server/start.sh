@@ -47,6 +47,10 @@ BASE_MASTER_PORT=29500
 # Action mode
 export LIBERO_OSC_TYPE=pose_rel
 
+# Camera configuration
+CAMERA_HEIGHT=256
+CAMERA_WIDTH=256
+
 # ============================================
 # Calculate and Display Configuration
 # ============================================
@@ -164,6 +168,8 @@ for i in $(seq 0 $((NUM_SERVER_GROUPS - 1))); do
             --port ${SERVER_PORT} \
             --use_tcp \
             --distributed \
+            --camera_height ${CAMERA_HEIGHT} \
+            --camera_width ${CAMERA_WIDTH} \
         2>&1 | tee ${WORKSPACE}/logs/isaac_server${i}_${TIMESTAMP}.log &
     
     SERVER_PIDS+=($!)

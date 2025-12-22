@@ -81,10 +81,14 @@ logger = logging.getLogger(__name__)
 def extract_images_and_states(obs):
     """Extract images and states from Isaac Lab MultiTaskObservationsCfg format.
 
-    Expected input format (all with concatenate_terms=False):
+    Supports two rgb_camera formats:
+    1. concatenate_terms=False (dict): {"agentview_cam": [N, H, W, 3], "eye_in_hand_cam": [N, H, W, 3]}
+    2. concatenate_terms=True (array): [N, H, W, 6] (agentview + eye_in_hand concatenated on channel dim)
+
+    Expected input format:
     {
-        "policy": {"eef_pose": [N, 7], "gripper_pos": [N, 1], ...},
-        "rgb_camera": {"agentview_cam": [N, H, W, 3]}
+        "policy": {"eef_pose": [N, 7], "gripper_pos": [N, 1], ...} or [N, state_dim] (concatenated)
+        "rgb_camera": dict or numpy array
     }
 
     Returns:
@@ -95,26 +99,39 @@ def extract_images_and_states(obs):
     """
     result = {}
 
-    # Extract image from rgb_camera dict
-    if "rgb_camera" in obs and isinstance(obs["rgb_camera"], dict):
+    # Extract image from rgb_camera
+    if "rgb_camera" in obs:
         rgb_camera = obs["rgb_camera"]
-        if "agentview_cam" in rgb_camera:
-            result["full_image"] = rgb_camera["agentview_cam"]  # [N, H, W, 3]
-            result["camera_name"] = "agentview"
+        if isinstance(rgb_camera, dict):
+            # Format 1: concatenate_terms=False, dict with camera names
+            if "agentview_cam" in rgb_camera:
+                result["full_image"] = rgb_camera["agentview_cam"]  # [N, H, W, 3]
+                result["camera_name"] = "agentview"
+        elif isinstance(rgb_camera, np.ndarray):
+            # Format 2: concatenate_terms=True, concatenated array [N, H, W, C]
+            # agentview_cam is the first camera, take first 3 channels
+            if rgb_camera.ndim == 4 and rgb_camera.shape[-1] >= 3:
+                result["full_image"] = rgb_camera[:, :, :, :3]  # [N, H, W, 3]
+                result["camera_name"] = "agentview"
 
-    # Extract state from policy dict
-    if "policy" in obs and isinstance(obs["policy"], dict):
-        policy_dict = obs["policy"]
-        state_list = []
-        for key in ["eef_pose", "gripper_pos"]:
-            if key in policy_dict:
-                val = policy_dict[key]
-                if hasattr(val, "shape"):
-                    if len(val.shape) > 2:
-                        val = val.reshape(val.shape[0], -1)
-                    state_list.append(val)
-        if state_list:
-            result["state"] = np.concatenate(state_list, axis=-1)
+    # Extract state from policy
+    if "policy" in obs:
+        policy = obs["policy"]
+        if isinstance(policy, dict):
+            # Format 1: concatenate_terms=False, dict with state terms
+            state_list = []
+            for key in ["eef_pose", "gripper_pos"]:
+                if key in policy:
+                    val = policy[key]
+                    if hasattr(val, "shape"):
+                        if len(val.shape) > 2:
+                            val = val.reshape(val.shape[0], -1)
+                        state_list.append(val)
+            if state_list:
+                result["state"] = np.concatenate(state_list, axis=-1)
+        elif isinstance(policy, np.ndarray):
+            # Format 2: concatenate_terms=True, already concatenated
+            result["state"] = policy
 
     return result
 
