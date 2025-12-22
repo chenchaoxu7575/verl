@@ -735,30 +735,37 @@ class EnvWorkerServer(Worker):
         server_requests = {rank: group["env_indices"] for rank, group in server_env_groups.items()}
 
         # Reset all server groups (one per stage)
-        server_responses = {}
+        # Store responses per stage: server_responses[stage_id][rank] = obs
+        server_responses_per_stage: dict[int, dict[int, dict]] = {}
         for stage_id in range(self.num_server_groups):
             print(f"[EnvWorker] Reset: Server group {stage_id}", flush=True)
             stage_responses = self.client.reset_batched(server_requests, stage_id=stage_id)
 
-            # Use responses from group 0 for initial observations
-            # (all groups start with same state, so we only need obs from one)
-            if stage_id == 0:
-                for rank, response in stage_responses.items():
-                    if response is None or response.get("status") != "ok":
-                        raise RuntimeError(
-                            f"[rank={self.rank}] Reset to server group {stage_id} server {rank} failed: {response}"
-                        )
-                    server_responses[rank] = response["obs"]
+            # Validate and store responses from each server group
+            server_responses_per_stage[stage_id] = {}
+            for rank, response in stage_responses.items():
+                if response is None or response.get("status") != "ok":
+                    raise RuntimeError(
+                        f"[rank={self.rank}] Reset to server group {stage_id} server {rank} failed: {response}"
+                    )
+                server_responses_per_stage[stage_id][rank] = response["obs"]
 
         # === Phase 3: Reconstruct result_list in trajectory order ===
-        # Track position within each server's response
-        server_positions = {rank: 0 for rank in server_env_groups.keys()}
+        # Each trajectory uses observations from its corresponding stage's server group
+        # Trajectories are interleaved across stages: traj 0 → stage 0, traj 1 → stage 1, ...
+        # Track position within each (stage, server_rank) response
+        server_positions_per_stage = {
+            stage_id: {rank: 0 for rank in server_env_groups.keys()}
+            for stage_id in range(self.num_server_groups)
+        }
         result_list = []
 
         for traj_idx in range(num_trajectories):
+            # Determine which stage will handle this trajectory (interleaved assignment)
+            stage_id = traj_idx % self.num_server_groups
             server_rank = traj_to_server[traj_idx]
-            obs = server_responses[server_rank]
-            pos = server_positions[server_rank]
+            obs = server_responses_per_stage[stage_id][server_rank]
+            pos = server_positions_per_stage[stage_id][server_rank]
 
             # Extract this trajectory's observations from server response
             traj_obs = {}
@@ -776,7 +783,7 @@ class EnvWorkerServer(Worker):
                     traj_obs[key] = value
 
             result_list.append(traj_obs)
-            server_positions[server_rank] += self.num_envs
+            server_positions_per_stage[stage_id][server_rank] += self.num_envs
 
         # Store active keys for fallback (backward compatibility)
         self._active_trajectory_keys = trajectory_keys
