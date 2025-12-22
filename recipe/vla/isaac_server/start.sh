@@ -16,7 +16,7 @@ WORKSPACE=/workspace/verl_vla/
 
 # Clean up any existing Isaac server processes
 echo "Cleaning up existing Isaac server processes..."
-pkill -f "isaac_server.py" 2>/dev/null || true
+pkill -f "isaac_server/server.py" 2>/dev/null || true
 sleep 2
 
 # ============================================
@@ -158,7 +158,7 @@ for i in $(seq 0 $((NUM_SERVER_GROUPS - 1))); do
     ${PYTHON} -m torch.distributed.run \
         --nproc_per_node=${NUM_GPUS} \
         --master_port=${MASTER_PORT} \
-        ${WORKSPACE}/verl/recipe/vla/workers/env/server/isaac_server.py \
+        ${WORKSPACE}/verl/recipe/vla/isaac_server/server.py \
             --num_tasks ${NUM_TASKS} \
             --group_size ${GROUP_SIZE} \
             --port ${SERVER_PORT} \

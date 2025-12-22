@@ -116,7 +116,7 @@ def main_task(config):
         # Choose EnvWorker based on server mode config
         use_server_mode = config.env.train.get("use_server_mode", False)
         if use_server_mode:
-            from recipe.vla.workers.env.server import EnvWorkerServer as EnvWorker
+            from recipe.vla.workers.env import EnvWorkerServer as EnvWorker
 
             logger.info("Using Isaac Server mode (EnvWorkerServer)")
             logger.info(
@@ -179,7 +179,7 @@ def main_task(config):
     # Create task-balanced sampler for server mode
     train_sampler = None
     if use_server_mode:
-        from recipe.vla.workers.env.server import create_task_balanced_sampler
+        from recipe.vla.workers.env import create_task_balanced_sampler
 
         # Pass env config to sampler for task balancing
         # For dual server mode, also pass stage_num and dual_server_mode

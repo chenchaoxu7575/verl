@@ -54,7 +54,7 @@ Usage:
     Replace EnvWorker import with EnvWorkerServer in main_ppo.py:
 
     # from recipe.vla.workers.env.env_worker import EnvWorker
-    from recipe.vla.workers.env.server import EnvWorkerServer as EnvWorker
+    from recipe.vla.workers.env import EnvWorkerServer as EnvWorker
 """
 
 import logging
@@ -73,7 +73,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_name
 from verl.utils.distributed import initialize_global_process_group_ray
 
-from .isaac_client import IsaacMultiServerClient
+from recipe.vla.isaac_server import IsaacMultiServerClient
 
 logger = logging.getLogger(__name__)
 

@@ -13,22 +13,19 @@
 # limitations under the License.
 
 """
-Isaac Lab Server Mode Components
+Environment Workers Module
 
-This module provides server-based Isaac Lab integration for VeRL:
-- IsaacMultiTaskServer: Standalone server running multi-task Isaac environments
-- IsaacClient: ZMQ client for communicating with the server
-- EnvWorkerServer: Drop-in replacement for EnvWorker using server mode
-- TaskBalancedSampler: Ensures balanced task distribution in batches
+This module provides environment worker implementations for VLA training:
+    - EnvWorker: Standard worker with local Isaac Lab instance
+    - EnvWorkerServer: Server mode worker connecting to Isaac Multi-Task Server
 """
 
 from .env_worker_server import EnvWorkerServer
-from .isaac_client import IsaacClient
-from .server_utils import TaskBalancedSampler, create_task_balanced_sampler
+from .utils import TaskBalancedSampler, create_task_balanced_sampler
 
 __all__ = [
-    "IsaacClient",
     "EnvWorkerServer",
     "TaskBalancedSampler",
     "create_task_balanced_sampler",
 ]
+
