@@ -14,19 +14,18 @@
 """
 Utility classes and functions for Isaac Server mode.
 
-- TaskBalancedSampler: Ensures each batch has at most max_per_task samples per task
+- TaskBalancedSampler: Ensures each batch has at most max_per_task samples per task/stage
 - create_task_balanced_sampler: Factory function with server config integration
 
-Multi-Server-Group Mode:
-    When stage_num > 1, each pipeline stage has its own server group.
-    The constraint changes from "max_per_task per batch" to "max_per_task per stage".
+The sampler enforces per-stage task balancing. Each stage has its own server group,
+so we ensure each stage's portion respects the max_per_task constraint independently.
 
-    Batch is assigned to stages via round-robin:
-        - Stage 0: env_0, env_2, env_4, ...
-        - Stage 1: env_1, env_3, env_5, ...
+Batch is assigned to stages via round-robin:
+    - Stage 0: batch[0], batch[2], batch[4], ...
+    - Stage 1: batch[1], batch[3], batch[5], ...
 
-    So we need to ensure that within each stage's portion of the batch,
-    no task exceeds the server's group_size capacity.
+When stage_num=1 (default), samples_per_stage = batch_size, and the behavior
+is equivalent to simple per-batch balancing.
 
 Note:
     num_server_groups must match stage_num (pipeline_stage_num).
@@ -44,27 +43,25 @@ logger = logging.getLogger(__name__)
 
 class TaskBalancedSampler(Sampler):
     """
-    A sampler that pre-arranges indices to ensure balanced task distribution in each batch.
+    A sampler that pre-arranges indices to ensure balanced task distribution per stage.
 
-    When the DataLoader takes consecutive batch_size indices, they will have at most
-    max_per_task samples from any single task.
+    Each stage gets samples_per_stage = batch_size // stage_num samples.
+    Within each stage, no task exceeds max_per_task samples.
+    Samples are interleaved across stages: [s0[0], s1[0], s0[1], s1[1], ...]
+
+    When stage_num=1 (default), this reduces to simple per-batch balancing.
 
     This is critical for Isaac Server mode where each task has limited env capacity:
         max_envs_per_task = server_group_size / num_envs_per_trajectory
 
-    Multi-Server-Group Mode (stage_num > 1):
-        When stage_num > 1, the constraint is enforced per-stage.
-        Envs are assigned round-robin to stages, so we interleave samples to
-        ensure each stage's task distribution stays within limits.
-
     Args:
         dataset: The dataset to sample from (must have 'task_ids' field)
         batch_size: Total number of samples per batch
-        max_per_task: Maximum samples from any single task in a batch (or per-stage when stage_num > 1)
+        max_per_task: Maximum samples from any single task per stage
         drop_last: Whether to drop the last incomplete batch
         shuffle: Whether to shuffle within and across tasks
         seed: Random seed for reproducibility
-        stage_num: Number of pipeline stages (default 1). When > 1, enables per-stage balancing.
+        stage_num: Number of pipeline stages (default 1)
     """
 
     def __init__(
@@ -93,9 +90,8 @@ class TaskBalancedSampler(Sampler):
         # Build task -> sample indices mapping
         self._build_task_indices()
 
-        mode_str = "multi-stage" if stage_num > 1 else "standard"
         logger.info(
-            f"TaskBalancedSampler initialized ({mode_str} mode): "
+            f"TaskBalancedSampler initialized: "
             f"batch_size={batch_size}, max_per_task={max_per_task}, "
             f"stage_num={stage_num}, samples_per_stage={self.samples_per_stage}, "
             f"num_tasks={len(self.task_to_indices)}, total_samples={len(dataset)}"
@@ -128,98 +124,28 @@ class TaskBalancedSampler(Sampler):
     def _validate_config(self):
         """Validate that configuration is viable."""
         num_tasks = len(self.task_to_indices)
-
-        if self.stage_num > 1:
-            # In multi-stage mode, each stage must be fillable independently
-            max_possible_per_stage = num_tasks * self.max_per_task
-            if max_possible_per_stage < self.samples_per_stage:
-                logger.warning(
-                    f"[Multi-Stage] Cannot fill samples_per_stage={self.samples_per_stage} "
-                    f"with max_per_task={self.max_per_task} and only {num_tasks} tasks. "
-                    f"Max possible per stage: {max_possible_per_stage}. "
-                    f"Consider reducing batch_size, increasing max_per_task, or using more tasks."
-                )
-        else:
-            max_possible_per_batch = num_tasks * self.max_per_task
-            if max_possible_per_batch < self.batch_size:
-                logger.warning(
-                    f"Cannot fill batch_size={self.batch_size} with max_per_task={self.max_per_task} "
-                    f"and only {num_tasks} tasks. Max possible: {max_possible_per_batch}. "
-                    f"Consider reducing batch_size or increasing max_per_task."
-                )
+        # Each stage must be fillable independently
+        # When stage_num=1, samples_per_stage = batch_size, so this works for both cases
+        max_possible_per_stage = num_tasks * self.max_per_task
+        if max_possible_per_stage < self.samples_per_stage:
+            logger.warning(
+                f"Cannot fill samples_per_stage={self.samples_per_stage} "
+                f"with max_per_task={self.max_per_task} and only {num_tasks} tasks. "
+                f"Max possible per stage: {max_possible_per_stage}. "
+                f"Consider reducing batch_size, increasing max_per_task, or using more tasks."
+            )
 
     def set_epoch(self, epoch: int):
         """Set epoch for shuffling reproducibility."""
         self._epoch = epoch
 
     def _generate_balanced_indices(self) -> list[int]:
-        """Generate all indices in an order that ensures balanced batches."""
-        if self.stage_num > 1:
-            return self._generate_multi_stage_indices()
-        else:
-            return self._generate_standard_indices()
-
-    def _generate_standard_indices(self) -> list[int]:
-        """Generate indices with per-batch task balancing (standard mode)."""
-        rng = random.Random(self.seed + self._epoch if self.seed else None)
-
-        # Create a copy of indices for each task
-        remaining = {task_id: list(indices) for task_id, indices in self.task_to_indices.items()}
-
-        # Shuffle within each task if needed
-        if self.shuffle:
-            for indices in remaining.values():
-                rng.shuffle(indices)
-
-        all_indices = []
-        active_tasks = set(remaining.keys())
-
-        while active_tasks:
-            batch = []
-            task_counts = defaultdict(int)
-
-            # Try to fill one batch
-            task_list = list(active_tasks)
-            if self.shuffle:
-                rng.shuffle(task_list)
-
-            # Round-robin across tasks to ensure balance
-            made_progress = True
-            while len(batch) < self.batch_size and made_progress:
-                made_progress = False
-                for task_id in task_list:
-                    if task_id not in active_tasks:
-                        continue
-                    if task_counts[task_id] >= self.max_per_task:
-                        continue
-                    if not remaining[task_id]:
-                        active_tasks.discard(task_id)
-                        continue
-
-                    # Take one sample from this task
-                    idx = remaining[task_id].pop()
-                    batch.append(idx)
-                    task_counts[task_id] += 1
-                    made_progress = True
-
-                    if len(batch) >= self.batch_size:
-                        break
-
-            # Add batch to all_indices
-            if len(batch) == self.batch_size:
-                all_indices.extend(batch)
-            elif len(batch) > 0 and not self.drop_last:
-                all_indices.extend(batch)
-
-            # Check if we've exhausted all tasks
-            if not active_tasks or (not made_progress and len(batch) < self.batch_size):
-                break
-
-        return all_indices
-
-    def _generate_multi_stage_indices(self) -> list[int]:
         """
-        Generate indices with per-stage task balancing (multi-stage mode).
+        Generate indices with per-stage task balancing.
+
+        Works for both single-stage (standard) and multi-stage modes:
+        - stage_num=1: Standard mode, samples_per_stage = batch_size
+        - stage_num>1: Multi-stage mode, samples are interleaved across stages
 
         When stage_num > 1, batch is split into stages via round-robin:
             - Stage 0: batch[0], batch[2], batch[4], ...
@@ -230,11 +156,12 @@ class TaskBalancedSampler(Sampler):
 
         Strategy:
             1. Generate samples for each stage separately (each with max_per_task limit)
-            2. Interleave stage samples to create the batch
+            2. Interleave stage samples to create the batch (no-op when stage_num=1)
         """
         rng = random.Random(self.seed + self._epoch if self.seed else None)
 
         # Create separate copies for each stage
+        # When stage_num=1, this is just one copy (same as standard mode)
         stage_remaining = []
         for _ in range(self.stage_num):
             remaining = {task_id: list(indices) for task_id, indices in self.task_to_indices.items()}
@@ -296,6 +223,7 @@ class TaskBalancedSampler(Sampler):
             stage_sizes = [len(sb) for sb in stage_batches]
             if all(s == self.samples_per_stage for s in stage_sizes):
                 # Interleave: [s0[0], s1[0], s0[1], s1[1], ...]
+                # When stage_num=1, this just extends with stage_batches[0]
                 batch = []
                 for i in range(self.samples_per_stage):
                     for stage_id in range(self.stage_num):
@@ -350,26 +278,30 @@ def create_task_balanced_sampler(data_config, dataset):
     # In Isaac Server, each task has server_group_size envs
     # Each env produces one trajectory, so max_per_task = server_group_size / num_envs
     max_per_task = server_group_size // num_envs
+    samples_per_stage = batch_size // stage_num
 
-    mode_str = "multi-stage" if stage_num > 1 else "standard"
     logger.info(
-        f"Creating TaskBalancedSampler ({mode_str} mode): "
+        f"Creating TaskBalancedSampler: "
         f"server_group_size={server_group_size}, num_envs={num_envs}, "
-        f"max_per_task={max_per_task}, stage_num={stage_num}"
+        f"max_per_task={max_per_task}, stage_num={stage_num}, samples_per_stage={samples_per_stage}"
     )
 
-    if stage_num > 1:
-        # Validate: in multi-stage mode, each stage's capacity must fit
-        samples_per_stage = batch_size // stage_num
-        num_tasks = 10  # LIBERO benchmark has 10 tasks
+    # Validate: each stage's capacity must fit
+    # When stage_num=1, samples_per_stage = batch_size, so this works for both cases
+    # Get num_tasks from config or dataset
+    num_tasks = data_config.get("num_tasks", None)
+    if num_tasks is None and hasattr(dataset, "num_tasks"):
+        num_tasks = dataset.num_tasks
+    
+    if num_tasks is not None:
         max_possible_per_stage = num_tasks * max_per_task
         if max_possible_per_stage < samples_per_stage:
             raise ValueError(
-                f"[Multi-Stage] Configuration error: "
-                f"samples_per_stage={samples_per_stage} exceeds capacity. "
+                f"Configuration error: samples_per_stage={samples_per_stage} exceeds capacity. "
                 f"Max possible per stage = {num_tasks} tasks × {max_per_task} max_per_task = {max_possible_per_stage}. "
                 f"Solutions: increase server_group_size, decrease batch_size, or increase stage_num."
             )
+    # Note: If num_tasks is unknown here, TaskBalancedSampler._validate_config() will check after building task indices
 
     return TaskBalancedSampler(
         dataset=dataset,

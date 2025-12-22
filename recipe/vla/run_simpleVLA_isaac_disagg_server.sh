@@ -31,6 +31,9 @@ SERVER_GROUP_SIZE=16
 # 512 is required for libero benchmark, but you can reduce it in debugging to run faster
 MAX_EPISODE_STEPS=512
 
+# Number of tasks in the benchmark
+NUM_TASKS=10
+
 # isaac or libero
 # NOT SUPPORTED: libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
@@ -100,6 +103,7 @@ $PYTHON -m recipe.vla.main_ppo \
     data.val_files="$test_files" \
     data.train_batch_size=${BATCH_SIZE} \
     data.val_batch_size=${BATCH_SIZE} \
+    +data.num_tasks=${NUM_TASKS} \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     env.train.num_envs=$ROLLOUT_N \
     data.max_prompt_length=256 \
