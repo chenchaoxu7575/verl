@@ -212,8 +212,6 @@ class IsaacMultiTaskServer:
         )
 
         # Import Isaac Lab components (requires Isaac Sim to be running)
-        import argparse
-
         import gymnasium as gym
         from isaaclab.app import AppLauncher
 

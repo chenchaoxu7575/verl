@@ -153,13 +153,16 @@ class IsaacClient:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(self.server_address)
 
-    def step(self, actions: np.ndarray, env_indices: list) -> Optional[dict]:
+    def step(
+        self, actions: np.ndarray, env_indices: list, render_last_only: bool = True
+    ) -> Optional[dict]:
         """
         Send step command to server.
 
         Args:
             actions: Actions array, shape (len(env_indices), action_dim)
             env_indices: List of env indices to step
+            render_last_only: If True, only render the last step of action chunk
 
         Returns:
             dict with obs, rewards, terminations, truncations, infos
@@ -169,6 +172,7 @@ class IsaacClient:
             "cmd": "step",
             "actions": actions,
             "env_indices": env_indices,
+            "render_last_only": render_last_only,
         }
         return self._send_request(request)
 
@@ -186,25 +190,6 @@ class IsaacClient:
         if env_indices is not None:
             request["env_indices"] = env_indices
         return self._send_request(request)
-
-    def step_by_task(self, actions: np.ndarray, task_ids: list) -> Optional[dict]:
-        """
-        Step by task IDs (convenience method).
-
-        Args:
-            actions: Actions array, shape (len(task_ids), action_dim)
-            task_ids: List of task IDs
-
-        Returns:
-            dict with obs, rewards, terminations, truncations, infos
-        """
-        if self._task_to_env_indices is None:
-            self._fetch_task_mapping()
-
-        # Convert task_ids to env_indices
-        # For simplicity, use first env of each task
-        env_indices = [self._task_to_env_indices[tid][0] for tid in task_ids]
-        return self.step(actions, env_indices)
 
     def get_env_indices_for_task(self, task_id: int) -> list:
         """Get env indices for a given task ID."""
@@ -402,7 +387,9 @@ class IsaacDistributedClient:
         """Get the server rank that handles a given global task ID."""
         return self._global_task_to_server.get(global_task_id, 0)
 
-    def step(self, actions: np.ndarray, env_indices: list, server_rank: int) -> Optional[dict]:
+    def step(
+        self, actions: np.ndarray, env_indices: list, server_rank: int, render_last_only: bool = True
+    ) -> Optional[dict]:
         """
         Send step command to a specific server.
 
@@ -410,6 +397,7 @@ class IsaacDistributedClient:
             actions: Actions array
             env_indices: LOCAL env indices on that server
             server_rank: Which server to send to
+            render_last_only: If True, only render the last step of action chunk
 
         Returns:
             Response dict or None
@@ -417,7 +405,7 @@ class IsaacDistributedClient:
         if server_rank >= len(self.clients):
             logger.error(f"Invalid server rank: {server_rank}")
             return None
-        return self.clients[server_rank].step(actions, env_indices)
+        return self.clients[server_rank].step(actions, env_indices, render_last_only)
 
     def reset(self, env_indices: list, server_rank: int) -> Optional[dict]:
         """
@@ -435,7 +423,9 @@ class IsaacDistributedClient:
             return None
         return self.clients[server_rank].reset(env_indices)
 
-    def step_batched(self, server_requests: dict[int, tuple[np.ndarray, list]]) -> dict[int, dict]:
+    def step_batched(
+        self, server_requests: dict[int, tuple[np.ndarray, list]], render_last_only: bool = True
+    ) -> dict[int, dict]:
         """
         Send step commands to multiple servers CONCURRENTLY.
 
@@ -444,6 +434,7 @@ class IsaacDistributedClient:
         Args:
             server_requests: Dict mapping server_rank -> (actions, env_indices)
                 e.g., {0: (actions_0, [0,1,2]), 2: (actions_2, [8,9,10])}
+            render_last_only: If True, only render the last step of action chunk
 
         Returns:
             Dict mapping server_rank -> response dict
@@ -451,7 +442,7 @@ class IsaacDistributedClient:
         from concurrent.futures import as_completed
 
         def step_on_server(rank: int, actions: np.ndarray, indices: list):
-            response = self.clients[rank].step(actions, indices)
+            response = self.clients[rank].step(actions, indices, render_last_only)
             return rank, response
 
         # Submit all tasks to persistent executor
@@ -636,12 +627,6 @@ class IsaacMultiServerClient:
 
         return all_connected
 
-    def get_client_for_stage(self, stage_id: int) -> IsaacDistributedClient:
-        """Get the client for a specific pipeline stage."""
-        if stage_id >= len(self.stage_clients):
-            raise ValueError(f"Invalid stage_id: {stage_id}, max is {len(self.stage_clients) - 1}")
-        return self.stage_clients[stage_id]
-
     def get_env_indices_for_task(self, global_task_id: int) -> list:
         """Get env indices for a task (same across all stages)."""
         return self.stage_clients[0].get_env_indices_for_task(global_task_id)
@@ -650,7 +635,14 @@ class IsaacMultiServerClient:
         """Get server rank for a task (same across all stages)."""
         return self.stage_clients[0].get_server_for_task(global_task_id)
 
-    def step(self, actions: np.ndarray, env_indices: list, server_rank: int, stage_id: int) -> Optional[dict]:
+    def step(
+        self,
+        actions: np.ndarray,
+        env_indices: list,
+        server_rank: int,
+        stage_id: int,
+        render_last_only: bool = True,
+    ) -> Optional[dict]:
         """
         Send step command to a specific server in a specific stage's server group.
 
@@ -659,11 +651,12 @@ class IsaacMultiServerClient:
             env_indices: LOCAL env indices on that server
             server_rank: Which server in the group
             stage_id: Which pipeline stage (determines which server group)
+            render_last_only: If True, only render the last step of action chunk
 
         Returns:
             Response dict or None
         """
-        return self.stage_clients[stage_id].step(actions, env_indices, server_rank)
+        return self.stage_clients[stage_id].step(actions, env_indices, server_rank, render_last_only)
 
     def reset(self, env_indices: list, server_rank: int, stage_id: int) -> Optional[dict]:
         """
@@ -679,18 +672,24 @@ class IsaacMultiServerClient:
         """
         return self.stage_clients[stage_id].reset(env_indices, server_rank)
 
-    def step_batched(self, server_requests: dict[int, tuple[np.ndarray, list]], stage_id: int) -> dict[int, dict]:
+    def step_batched(
+        self,
+        server_requests: dict[int, tuple[np.ndarray, list]],
+        stage_id: int,
+        render_last_only: bool = True,
+    ) -> dict[int, dict]:
         """
         Send batched step commands to a specific stage's server group.
 
         Args:
             server_requests: Dict mapping server_rank -> (actions, env_indices)
             stage_id: Which pipeline stage
+            render_last_only: If True, only render the last step of action chunk
 
         Returns:
             Dict mapping server_rank -> response dict
         """
-        return self.stage_clients[stage_id].step_batched(server_requests)
+        return self.stage_clients[stage_id].step_batched(server_requests, render_last_only)
 
     def reset_batched(self, server_requests: dict[int, list], stage_id: int) -> dict[int, dict]:
         """
