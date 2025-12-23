@@ -67,13 +67,12 @@ from omegaconf import DictConfig
 from torch.distributed.device_mesh import init_device_mesh
 
 from recipe.vla.envs.action_utils import prepare_actions, put_info_on_image, save_rollout_video, tile_images
+from recipe.vla.isaac_server import IsaacMultiServerClient
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_name
 from verl.utils.distributed import initialize_global_process_group_ray
-
-from recipe.vla.isaac_server import IsaacMultiServerClient
 
 logger = logging.getLogger(__name__)
 
@@ -424,26 +423,26 @@ class EnvWorkerServer(Worker):
                 for i, key in enumerate(trajectory_keys):
                     task_id = self._trajectory_registry[key]["task_id"]
                     img = full_images[i]
-                    
+
                     # Add info overlay (like IsaacEnv.add_new_frames)
                     # Handle chunk rewards: take last step or mean
                     if len(rewards.shape) > 1:
                         reward_val = float(rewards[i, -1])  # Last chunk step
                     else:
                         reward_val = float(rewards[i])
-                    
+
                     if len(terminations.shape) > 1:
                         term_val = bool(terminations[i, -1])
                     else:
                         term_val = bool(terminations[i])
-                    
+
                     plot_info = {
                         "reward": reward_val,
                         "done": term_val,
                         "task": task_id,
                     }
                     img = put_info_on_image(img, plot_info)
-                    
+
                     if task_id not in task_id_to_images:
                         task_id_to_images[task_id] = []
                     task_id_to_images[task_id].append(img)
@@ -522,9 +521,7 @@ class EnvWorkerServer(Worker):
         # === Phase 3: Send requests to stage-specific server group ===
         # Key difference: pass stage_id to route to correct server group
         # render_last_only: only render the last step of the action chunk for efficiency
-        responses = self.client.step_batched(
-            server_requests, stage_id=stage_id, render_last_only=render_last_only
-        )
+        responses = self.client.step_batched(server_requests, stage_id=stage_id, render_last_only=render_last_only)
 
         # Validate responses
         all_responses = {}
@@ -772,8 +769,7 @@ class EnvWorkerServer(Worker):
         # Trajectories are interleaved across stages: traj 0 → stage 0, traj 1 → stage 1, ...
         # Track position within each (stage, server_rank) response
         server_positions_per_stage = {
-            stage_id: {rank: 0 for rank in server_env_groups.keys()}
-            for stage_id in range(self.num_server_groups)
+            stage_id: {rank: 0 for rank in server_env_groups.keys()} for stage_id in range(self.num_server_groups)
         }
         result_list = []
 

@@ -292,7 +292,7 @@ def create_task_balanced_sampler(data_config, dataset):
     num_tasks = data_config.get("num_tasks", None)
     if num_tasks is None and hasattr(dataset, "num_tasks"):
         num_tasks = dataset.num_tasks
-    
+
     if num_tasks is not None:
         max_possible_per_stage = num_tasks * max_per_task
         if max_possible_per_stage < samples_per_stage:

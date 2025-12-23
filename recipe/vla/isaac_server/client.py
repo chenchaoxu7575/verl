@@ -153,9 +153,7 @@ class IsaacClient:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(self.server_address)
 
-    def step(
-        self, actions: np.ndarray, env_indices: list, render_last_only: bool = True
-    ) -> Optional[dict]:
+    def step(self, actions: np.ndarray, env_indices: list, render_last_only: bool = True) -> Optional[dict]:
         """
         Send step command to server.
 

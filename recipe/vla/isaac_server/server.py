@@ -51,20 +51,20 @@ logger = logging.getLogger("IsaacServer")
 
 def setup_per_process_caches():
     """Setup per-process cache directories to avoid locking conflicts.
-    
+
     When multiple Isaac processes run on the same node, they can conflict
     when accessing shared cache databases. This function creates unique
     cache directories for each process based on LOCAL_RANK.
-    
+
     Caches isolated:
     1. OptiX cache - prevents denoiser database locking
     2. NVIDIA Shader cache - prevents shader compilation conflicts
     3. Omniverse Kit cache - prevents general caching conflicts
-    
+
     Must be called BEFORE importing any Isaac/Omniverse modules.
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
+
     # === OptiX Cache ===
     # Get base cache path from environment (set by start_isaac_server.sh)
     optix_base = os.environ.get("OPTIX_CACHE_PATH", "/tmp/optix_cache")
@@ -72,7 +72,7 @@ def setup_per_process_caches():
     os.makedirs(optix_rank_cache, exist_ok=True)
     os.environ["OPTIX_CACHE_PATH"] = optix_rank_cache
     os.environ["OPTIX7_CACHE_PATH"] = optix_rank_cache
-    
+
     # === NVIDIA Driver Shader Cache ===
     shader_base = os.environ.get("__GL_SHADER_DISK_CACHE_PATH", "/tmp/nv_shader_cache")
     shader_rank_cache = os.path.join(shader_base, f"rank_{local_rank}")
@@ -80,13 +80,13 @@ def setup_per_process_caches():
     os.environ["__GL_SHADER_DISK_CACHE"] = "1"
     os.environ["__GL_SHADER_DISK_CACHE_PATH"] = shader_rank_cache
     os.environ["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
-    
+
     # === Omniverse Kit Cache ===
     ov_base = os.environ.get("OMNI_KIT_CACHE_DIR", "/tmp/ov_cache")
     ov_rank_cache = os.path.join(ov_base, f"rank_{local_rank}")
     os.makedirs(ov_rank_cache, exist_ok=True)
     os.environ["OMNI_KIT_CACHE_DIR"] = ov_rank_cache
-    
+
     logger.info(f"[Rank {local_rank}] Cache directories:")
     logger.info(f"[Rank {local_rank}]   OptiX:  {optix_rank_cache}")
     logger.info(f"[Rank {local_rank}]   Shader: {shader_rank_cache}")
@@ -255,9 +255,7 @@ class IsaacMultiTaskServer:
             env_cfg.camera_height = self.camera_height
             env_cfg.camera_width = self.camera_width
             env_cfg.recreate_cameras()
-            logger.info(
-                f"[Rank {self.local_rank}] Set camera dimensions: {self.camera_width}x{self.camera_height}"
-            )
+            logger.info(f"[Rank {self.local_rank}] Set camera dimensions: {self.camera_width}x{self.camera_height}")
 
         # In distributed mode, we need to adjust the task configuration
         # Each server only handles a subset of tasks
