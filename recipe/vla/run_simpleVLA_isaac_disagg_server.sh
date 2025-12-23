@@ -94,6 +94,8 @@ fi
 # avoiding warnings
 mkdir -p /root/LIBERO/libero/libero/../datasets
 
+SAVE_VIDEO=False
+
 export PYTHONRECURSIONLIMIT=10000
 # uncomment this to see full error messages
 # export HYDRA_FULL_ERROR=1
@@ -114,7 +116,7 @@ $PYTHON -m recipe.vla.main_ppo \
     env.actor.model.action_dim=7 \
     env.train.only_eval=False \
     env.train.max_episode_steps=$MAX_EPISODE_STEPS \
-    env.train.video_cfg.save_video=True \
+    env.train.video_cfg.save_video=$SAVE_VIDEO \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
     env.disagg_sim.enable=True \
@@ -165,7 +167,7 @@ $PYTHON -m recipe.vla.main_ppo \
     trainer.test_freq=-1 \
     trainer.total_epochs=20 \
     trainer.val_only=False \
-    trainer.total_training_steps=1000 \
+    trainer.total_training_steps=10000 \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
