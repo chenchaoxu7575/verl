@@ -1,7 +1,7 @@
 #!/bin/bash
 set -x
 
-echo "remember to set ray param < --resources='{\"sim\"/\"actor_rollout\":1}' > if using disagg sim"
+echo "Ray Actor Mode: Isaac Sim runs as Ray actors (unified resource management)"
 
 WORKSPACE=/workspace/verl_vla/
 
@@ -11,7 +11,7 @@ libero_test_path=$WORKSPACE/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$WORKSPACE/models/vla_libero_grpo_server"}
+OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$WORKSPACE/models/vla_libero_grpo_ray"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$WORKSPACE"}/video/$(date +%Y%m%d_%H%M%S)
 TIMELINE_FILE=${TIMELINE_FILE:-"$WORKSPACE/logs/ray_timeline_$(date +%Y%m%d_%H%M%S).json"}
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$WORKSPACE/data/Openvla-oft-SFT-libero10-trajall"}
@@ -25,64 +25,81 @@ NUM_ROLLOUT_GPUS=8
 STAGE_NUM=2
 BATCH_SIZE=16
 # rollout.n should equal to num_envs for isaac env
+# GROUP_SIZE / ROLLOUT_N = max trajectories per task (need >= 2 for uneven data distribution)
 ROLLOUT_N=8
 SERVER_GROUP_SIZE=16
 
 # 512 is required for libero benchmark, but you can reduce it in debugging to run faster
-MAX_EPISODE_STEPS=512
+MAX_EPISODE_STEPS=128
 
 # Number of tasks in the benchmark
+# Must satisfy: NUM_TASKS × GROUP_SIZE = NUM_ROLLOUT_GPUS × STAGE_NUM × ROLLOUT_N
 NUM_TASKS=10
 
 # isaac or libero
 # NOT SUPPORTED: libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
 SIM_TYPE=${SIM_TYPE:-"isaac"}
-PROJECT_NAME="vla-disagg-isaac-server"
-EXPERIMENT_NAME="${SIM_TYPE}_server_rl"
+PROJECT_NAME="vla-ray-isaac"
+EXPERIMENT_NAME="${SIM_TYPE}_ray_rl"
 
 # ============================================
-# Isaac Server Configuration
+# Isaac Ray Actor Mode Configuration
 # ============================================
-USE_SERVER_MODE=True
+# Ray actor mode: Isaac Sim runs as Ray actors
+# - Ray manages all GPU resources uniformly
+# - No manual server startup needed
+# - Actors are created and scheduled by Ray
+# ============================================
 
-# Number of Isaac servers per group (one per GPU)
-NUM_ISAAC_SERVERS=8
+# Enable Ray actor mode (recommended)
+USE_RAY_ACTORS=True
 
-# Number of server groups - MUST match STAGE_NUM (pipeline_stage_num)
-# Each pipeline stage uses its own server group for physical isolation
-# This enables Gen-Sim parallel execution and prevents env state interference
-NUM_SERVER_GROUPS=$STAGE_NUM
+# Disable legacy ZMQ server mode
+USE_SERVER_MODE=False
 
-# Server address configuration
-# Isaac Server runs on SIM_NODE, Client runs on TRAIN_NODE
-SIM_NODE_IP="10.185.189.15"
-ISAAC_SERVER_ADDRESS="tcp://${SIM_NODE_IP}"
-ISAAC_SERVER_USE_TCP=True
+# Number of Isaac actors per stage (one per GPU)
+NUM_ISAAC_ACTORS=$NUM_ENV_GPUS
 
-# Base ports for each server group (auto-generated with 50-port spacing)
-# Example with NUM_SERVER_GROUPS=2: [5556, 5606]
-# Server group 0 (Stage 0): ports 5556-5563
-# Server group 1 (Stage 1): ports 5606-5613
-BASE_PORT=5556
-PORT_SPACING=50
-SERVER_BASE_PORTS="[$(seq -s, $BASE_PORT $PORT_SPACING $((BASE_PORT + (NUM_SERVER_GROUPS-1) * PORT_SPACING)))]"
+# Isaac environment ID
+ISAAC_ENV_ID="Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"
 
-# Calculate required envs on server:
-# total_envs = NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N
-REQUIRED_SERVER_ENVS=$((NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N))
+# Camera settings
+CAMERA_HEIGHT=256
+CAMERA_WIDTH=256
+
+# Group size (envs per task) - configure directly
+# This is the number of parallel environments per task
+GROUP_SIZE=16
+
+# TOTAL_ENVS = environments participating in training (from rollout config)
+# ISAAC_ENVS = total environments in Isaac Sim (may be more, extras stay idle)
+TOTAL_ENVS=$((NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N))
+ISAAC_ENVS=$((NUM_TASKS * GROUP_SIZE))
 
 echo "============================================"
-echo "Isaac Server Configuration:"
-echo "  Servers per group: ${NUM_ISAAC_SERVERS}"
-echo "  Server groups: ${NUM_SERVER_GROUPS} (must match STAGE_NUM=${STAGE_NUM})"
-echo "  Server base ports: ${SERVER_BASE_PORTS}"
-echo "  Required server envs: $REQUIRED_SERVER_ENVS (${NUM_ROLLOUT_GPUS} rollout_gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} envs)"
-echo "  Envs per server: $((REQUIRED_SERVER_ENVS / NUM_ISAAC_SERVERS / NUM_SERVER_GROUPS))"
+echo "Environment allocation:"
+echo "  Training envs (total_envs): ${TOTAL_ENVS} = ${NUM_ROLLOUT_GPUS} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} rollout_n"
+echo "  Isaac Sim envs: ${ISAAC_ENVS} = ${NUM_TASKS} tasks × ${GROUP_SIZE} group_size"
+if [ $ISAAC_ENVS -lt $TOTAL_ENVS ]; then
+    echo "ERROR: Not enough Isaac envs! Need at least ${TOTAL_ENVS}"
+    exit 1
+fi
+echo "  Idle envs: $((ISAAC_ENVS - TOTAL_ENVS))"
+echo "============================================"
+
+echo "============================================"
+echo "Isaac Ray Actor Mode Configuration:"
+echo "  Mode: Ray Actor (unified resource management)"
+echo "  Isaac actors per stage: ${NUM_ISAAC_ACTORS}"
+echo "  Pipeline stages: ${STAGE_NUM}"
+echo "  Total actors: $((NUM_ISAAC_ACTORS * STAGE_NUM))"
+echo "  Tasks: ${NUM_TASKS}"
+echo "  Total envs: ${TOTAL_ENVS} (${NUM_ROLLOUT_GPUS} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} envs)"
+echo "  Group size (envs/task): ${GROUP_SIZE}"
 echo "============================================"
 echo ""
-echo "To start Isaac servers (in a separate terminal):"
-echo "  NUM_SERVER_GROUPS=${NUM_SERVER_GROUPS} ./start_isaac_server.sh"
+echo "No manual server startup needed - Ray manages everything!"
 echo "============================================"
 
 ISSC_PYTHON="/workspace/isaaclab/_isaac_sim/python.sh"
@@ -94,7 +111,7 @@ fi
 # avoiding warnings
 mkdir -p /root/LIBERO/libero/libero/../datasets
 
-SAVE_VIDEO=False
+SAVE_VIDEO=True
 
 export PYTHONRECURSIONLIMIT=10000
 # uncomment this to see full error messages
@@ -122,11 +139,13 @@ $PYTHON -m recipe.vla.main_ppo \
     env.disagg_sim.enable=True \
     env.disagg_sim.nnodes=$SIM_NODES \
     env.train.use_server_mode=$USE_SERVER_MODE \
-    env.train.isaac_server_address=$ISAAC_SERVER_ADDRESS \
-    +env.train.num_isaac_servers=$NUM_ISAAC_SERVERS \
-    +env.train.isaac_server_use_tcp=$ISAAC_SERVER_USE_TCP \
-    +env.train.num_server_groups=$NUM_SERVER_GROUPS \
-    +env.train.server_base_ports="$SERVER_BASE_PORTS" \
+    env.train.use_ray_actors=$USE_RAY_ACTORS \
+    env.train.num_isaac_actors=$NUM_ISAAC_ACTORS \
+    env.train.num_tasks=$NUM_TASKS \
+    env.train.group_size=$GROUP_SIZE \
+    env.train.env_id=$ISAAC_ENV_ID \
+    env.train.camera_height=$CAMERA_HEIGHT \
+    env.train.camera_width=$CAMERA_WIDTH \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
     actor_rollout_ref.rollout.mode=async_envloop \
@@ -162,15 +181,15 @@ $PYTHON -m recipe.vla.main_ppo \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     trainer.nnodes=$NUM_NODES \
-    +env.train.total_envs=$((NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N)) \
+    env.train.total_envs=$TOTAL_ENVS \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=20 \
     trainer.val_only=False \
-    trainer.total_training_steps=10000 \
+    trainer.total_training_steps=3 \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
     +ray_kwargs.timeline_json_file=$TIMELINE_FILE \
-    $@ 2>&1 | tee $WORKSPACE/logs/vla_isaac_disagg_server_$(date +%Y%m%d_%H%M%S).log
+    $@ 2>&1 | tee $WORKSPACE/logs/vla_isaac_ray_$(date +%Y%m%d_%H%M%S).log
 

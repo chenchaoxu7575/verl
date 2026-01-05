@@ -344,8 +344,10 @@ class EnvWorkerServer(Worker):
             )
             # Calculate which portion of active keys this stage_id corresponds to
             # stage_id -> which slice of _active_trajectory_keys
-            stage_start = stage_id * self.num_envs
-            stage_end = (stage_id + 1) * self.num_envs
+            # Each stage processes total_envs / stage_num environments
+            envs_per_stage = self.total_envs // self.stage_num
+            stage_start = stage_id * envs_per_stage
+            stage_end = (stage_id + 1) * envs_per_stage
             trajectory_keys = self._active_trajectory_keys[stage_start:stage_end]
             self._validate_trajectory_keys(trajectory_keys)
 

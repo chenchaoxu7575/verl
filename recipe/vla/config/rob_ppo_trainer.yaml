@@ -27,30 +27,70 @@ env:
     seed: 42
     task_suite_name: libero_10
 
-    # Isaac Server Mode Configuration
-    # When enabled, EnvWorker connects to a standalone Isaac server
-    # instead of managing its own Isaac instance
+    # ============================================================
+    # Isaac Simulation Mode Configuration
+    # ============================================================
+    # Three modes available:
+    # 1. Standard mode (use_server_mode=false, use_ray_actors=false):
+    #    - Each EnvWorker runs local Isaac instances
+    #    - Simple but limited scalability
+    #
+    # 2. ZMQ Server mode (use_server_mode=true, use_ray_actors=false):
+    #    - EnvWorker connects to standalone Isaac server via ZMQ
+    #    - Server must be started manually with start.sh
+    #
+    # 3. Ray Actor mode (use_ray_actors=true) [RECOMMENDED]:
+    #    - Isaac Sim runs as Ray actors
+    #    - Ray manages all resources uniformly
+    #    - No manual server startup needed
+    # ============================================================
+    
+    # Enable ZMQ server mode (legacy)
     use_server_mode: False
     
-    # Address of the Isaac server (IPC or TCP)
+    # Enable Ray actor mode (recommended for production)
+    use_ray_actors: False
+    
+    # Address of the Isaac server (only for ZMQ server mode)
     # IPC: "ipc:///tmp/isaac_server.sock"
     # TCP: "tcp://sim_node_ip:5555"
     isaac_server_address: "ipc:///tmp/isaac_server.sock"
     
-    # Number of EnvWorkerServer instances per node in server mode
-    # In server mode, workers are lightweight clients, so typically only need 1
+    # Number of EnvWorkerServer instances per node in server/Ray mode
+    # These are lightweight clients, so typically only need 1
     server_mode_env_workers: 1
+    
+    # Number of Isaac actors per stage (only for Ray actor mode)
+    # Typically equals the number of simulation GPUs
+    num_isaac_actors: 8
+    
+    # Number of tasks in the multi-task environment
+    num_tasks: 10
+    
+    # Envs per task (only for Ray actor mode)
+    # total_envs = num_tasks × group_size
+    group_size: 16
     
     # Original env worker count (how many workers would exist in standard mode)
     # This tells the coordinator how many stages to handle
     # total_stages = original_env_worker_count × pipeline_stage_num
     original_env_worker_count: 8
     
-    # Server's group_size (envs per task on the Isaac server)
-    # This must match the --group_size passed to isaac_server.py
+    # Server's group_size (envs per task on Isaac)
+    # Must match --group_size for ZMQ server, auto-configured for Ray actors
     # Max trajectories per task = server_group_size / num_envs
     # Example: group_size=32, num_envs=8 → 4 trajectories per task max
     server_group_size: 32
+    
+    # Total environments (for EnvWorkerServerRay coordination)
+    total_envs: 128
+    
+    # Environment ID for Isaac Lab
+    env_id: "Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"
+    
+    # Camera settings
+    camera_height: 256
+    camera_width: 256
 
     init_params:
       camera_depths: False

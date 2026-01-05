@@ -133,6 +133,14 @@ class RobRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_manager.get_resource_pool(Role.Env).accelerator_type = "sim"
             self.resource_pool_manager.get_resource_pool(Role.ActorRollout).accelerator_type = "train_rollout"
 
+            # In Ray actor mode, EnvWorkerServerRay is just a coordinator - no GPU needed
+            # IsaacSimActors will request their own GPUs independently
+            use_ray_actors = self.config.env.train.get("use_ray_actors", False)
+            if use_ray_actors:
+                env_pool = self.resource_pool_manager.get_resource_pool(Role.Env)
+                env_pool.use_gpu = False
+                logger.info("Ray actor mode: EnvWorkerServerRay will not request GPU (coordinator only)")
+
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
         actor_rollout_cls = RayClassWithInitArgs(

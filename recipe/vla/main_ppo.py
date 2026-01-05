@@ -115,10 +115,22 @@ def main_task(config):
 
         # Choose EnvWorker based on server mode config
         use_server_mode = config.env.train.get("use_server_mode", False)
-        if use_server_mode:
+        use_ray_actors = config.env.train.get("use_ray_actors", False)
+
+        if use_ray_actors:
+            # Ray actor mode: Isaac Sim runs as Ray actors (recommended)
+            from recipe.vla.workers.env import EnvWorkerServerRay as EnvWorker
+
+            logger.info("Using Isaac Ray Actor mode (EnvWorkerServerRay)")
+            logger.info(
+                f"Isaac actors: {config.env.train.get('num_isaac_actors', 8)} per stage, "
+                f"{config.env.rollout.pipeline_stage_num} stages"
+            )
+        elif use_server_mode:
+            # ZMQ server mode: Isaac Sim runs as separate ZMQ servers
             from recipe.vla.workers.env import EnvWorkerServer as EnvWorker
 
-            logger.info("Using Isaac Server mode (EnvWorkerServer)")
+            logger.info("Using Isaac ZMQ Server mode (EnvWorkerServer)")
             logger.info(
                 f"Server address: {config.env.train.get('isaac_server_address', 'ipc:///tmp/isaac_server.sock')}"
             )
@@ -149,12 +161,13 @@ def main_task(config):
         # colocated sim and actor rollout
         num_nodes_sim = config.trainer.nnodes
 
-    # In server mode, EnvWorkerServer is a lightweight client that doesn't need GPUs
-    # The Isaac Server manages all GPUs independently
-    if use_server_mode:
-        # Override env_gpu_num for server mode - only need 1 worker for coordination
+    # In server/Ray mode, EnvWorker is a lightweight client that doesn't need GPUs
+    # The Isaac Server/Ray actors manage all simulation GPUs independently
+    if use_ray_actors or use_server_mode:
+        # Override env_gpu_num - only need 1 worker for coordination, no GPU needed
         env_gpu_num = config.env.train.get("server_mode_env_workers", 1)
-        logger.info(f"Server mode: using {env_gpu_num} EnvWorkerServer(s) per node (lightweight clients)")
+        mode_name = "Ray actor" if use_ray_actors else "ZMQ server"
+        logger.info(f"{mode_name} mode: using {env_gpu_num} EnvWorker(s) per node (lightweight, no GPU)")
 
     resource_pool_spec = {
         train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
@@ -176,28 +189,27 @@ def main_task(config):
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
     val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
 
-    # Create task-balanced sampler for server mode
+    # Create task-balanced sampler for server mode or ray actor mode
+    # Both modes need balanced sampling to avoid exceeding per-task env capacity
     train_sampler = None
-    if use_server_mode:
+    if use_server_mode or use_ray_actors:
         from recipe.vla.workers.env import create_task_balanced_sampler
 
         # Pass env config to sampler for task balancing
-        # For dual server mode, also pass stage_num and dual_server_mode
-        dual_server_mode = config.env.train.get("dual_server_mode", False)
-        stage_num = config.env.rollout.pipeline_stage_num if dual_server_mode else 1
+        # For multi-stage mode, pass stage_num
+        stage_num = config.env.rollout.pipeline_stage_num
 
         sampler_config = OmegaConf.create(
             {
                 **OmegaConf.to_container(config.data),
-                "server_group_size": config.env.train.get("server_group_size", 64),
+                "server_group_size": config.env.train.get("group_size", 16),  # group_size = envs per task
                 "num_envs": config.env.train.num_envs,
                 "stage_num": stage_num,
-                "dual_server_mode": dual_server_mode,
             }
         )
         train_sampler = create_task_balanced_sampler(sampler_config, train_dataset)
-        mode_str = "dual server" if dual_server_mode else "standard"
-        logger.info(f"Using TaskBalancedSampler for server mode ({mode_str})")
+        mode_str = "ray actor" if use_ray_actors else "zmq server"
+        logger.info(f"Using TaskBalancedSampler for {mode_str} mode")
 
     trainer = RobRayPPOTrainer(
         config=config,

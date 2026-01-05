@@ -19,15 +19,26 @@ This module provides the Isaac Lab multi-task server and client for
 distributed reinforcement learning with Isaac Lab environments.
 
 Components:
+    ZMQ Mode (Legacy):
     - server.py: Isaac Lab multi-task server (runs as independent process)
-    - client.py: Client classes for connecting to Isaac servers
+        - client.py: Client classes for connecting to Isaac servers via ZMQ
     - start.sh: Shell script to launch distributed Isaac servers
+
+    Ray Mode (Recommended):
+        - ray_actor.py: IsaacSimActor - Ray Actor running Isaac Lab simulation
+        - ray_manager.py: IsaacSimActorManager - manages multiple actors across stages/GPUs
 """
 
 from .client import IsaacClient, IsaacDistributedClient, IsaacMultiServerClient
+from .ray_actor import IsaacSimActor
+from .ray_manager import IsaacSimActorManager
 
 __all__ = [
+    # ZMQ Mode (Legacy)
     "IsaacClient",
     "IsaacDistributedClient",
     "IsaacMultiServerClient",
+    # Ray Mode (Recommended)
+    "IsaacSimActor",
+    "IsaacSimActorManager",
 ]
