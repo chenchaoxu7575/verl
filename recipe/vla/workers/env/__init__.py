@@ -16,18 +16,14 @@
 Environment Workers Module
 
 This module provides environment worker implementations for VLA training:
-    - EnvWorker: Standard worker with local Isaac Lab instance
-    - EnvWorkerServer: Server mode worker connecting to Isaac Multi-Task Server (ZMQ)
-    - EnvWorkerServerRay: Ray-based worker using IsaacSimActorManager (Recommended)
+    - EnvWorkerServer: Ray-based worker using IsaacServerManager
 """
 
 from .env_worker_server import EnvWorkerServer
-from .env_worker_server_ray import EnvWorkerServerRay
 from .utils import TaskBalancedSampler, create_task_balanced_sampler
 
 __all__ = [
     "EnvWorkerServer",
-    "EnvWorkerServerRay",
     "TaskBalancedSampler",
     "create_task_balanced_sampler",
 ]

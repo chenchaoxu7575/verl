@@ -27,7 +27,6 @@ BATCH_SIZE=16
 # rollout.n should equal to num_envs for isaac env
 # GROUP_SIZE / ROLLOUT_N = max trajectories per task (need >= 2 for uneven data distribution)
 ROLLOUT_N=8
-SERVER_GROUP_SIZE=16
 
 # 512 is required for libero benchmark, but you can reduce it in debugging to run faster
 MAX_EPISODE_STEPS=128
@@ -43,23 +42,11 @@ SIM_TYPE=${SIM_TYPE:-"isaac"}
 PROJECT_NAME="vla-ray-isaac"
 EXPERIMENT_NAME="${SIM_TYPE}_ray_rl"
 
-# ============================================
-# Isaac Ray Actor Mode Configuration
-# ============================================
-# Ray actor mode: Isaac Sim runs as Ray actors
-# - Ray manages all GPU resources uniformly
-# - No manual server startup needed
-# - Actors are created and scheduled by Ray
-# ============================================
-
 # Enable Ray actor mode (recommended)
 USE_RAY_ACTORS=True
 
-# Disable legacy ZMQ server mode
-USE_SERVER_MODE=False
-
-# Number of Isaac actors per stage (one per GPU)
-NUM_ISAAC_ACTORS=$NUM_ENV_GPUS
+# Number of Isaac servers per stage (one per GPU)
+NUM_ISAAC_SERVERS=$NUM_ENV_GPUS
 
 # Isaac environment ID
 ISAAC_ENV_ID="Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"
@@ -91,9 +78,9 @@ echo "============================================"
 echo "============================================"
 echo "Isaac Ray Actor Mode Configuration:"
 echo "  Mode: Ray Actor (unified resource management)"
-echo "  Isaac actors per stage: ${NUM_ISAAC_ACTORS}"
+echo "  Isaac servers per stage: ${NUM_ISAAC_SERVERS}"
 echo "  Pipeline stages: ${STAGE_NUM}"
-echo "  Total actors: $((NUM_ISAAC_ACTORS * STAGE_NUM))"
+echo "  Total servers: $((NUM_ISAAC_SERVERS * STAGE_NUM))"
 echo "  Tasks: ${NUM_TASKS}"
 echo "  Total envs: ${TOTAL_ENVS} (${NUM_ROLLOUT_GPUS} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} envs)"
 echo "  Group size (envs/task): ${GROUP_SIZE}"
@@ -138,9 +125,8 @@ $PYTHON -m recipe.vla.main_ppo \
     env.train.seed=42 \
     env.disagg_sim.enable=True \
     env.disagg_sim.nnodes=$SIM_NODES \
-    env.train.use_server_mode=$USE_SERVER_MODE \
     env.train.use_ray_actors=$USE_RAY_ACTORS \
-    env.train.num_isaac_actors=$NUM_ISAAC_ACTORS \
+    env.train.num_isaac_servers=$NUM_ISAAC_SERVERS \
     env.train.num_tasks=$NUM_TASKS \
     env.train.group_size=$GROUP_SIZE \
     env.train.env_id=$ISAAC_ENV_ID \
@@ -177,7 +163,6 @@ $PYTHON -m recipe.vla.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.n_gpus_per_node=$NUM_ROLLOUT_GPUS \
-    env.train.server_group_size=$SERVER_GROUP_SIZE \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     trainer.nnodes=$NUM_NODES \

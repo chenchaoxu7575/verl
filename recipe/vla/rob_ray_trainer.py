@@ -133,13 +133,13 @@ class RobRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_manager.get_resource_pool(Role.Env).accelerator_type = "sim"
             self.resource_pool_manager.get_resource_pool(Role.ActorRollout).accelerator_type = "train_rollout"
 
-            # In Ray actor mode, EnvWorkerServerRay is just a coordinator - no GPU needed
-            # IsaacSimActors will request their own GPUs independently
+            # In Ray actor mode, EnvWorkerServer is just a coordinator - no GPU needed
+            # IsaacServers will request their own GPUs independently
             use_ray_actors = self.config.env.train.get("use_ray_actors", False)
             if use_ray_actors:
                 env_pool = self.resource_pool_manager.get_resource_pool(Role.Env)
                 env_pool.use_gpu = False
-                logger.info("Ray actor mode: EnvWorkerServerRay will not request GPU (coordinator only)")
+                logger.info("Ray actor mode: EnvWorkerServer will not request GPU (coordinator only)")
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
@@ -198,21 +198,11 @@ class RobRayPPOTrainer(RayPPOTrainer):
         if self.config.actor_rollout_ref.rollout.mode == "async_envloop":
             self.async_rollout_mode = True
 
-            # Use EnvLoopServer for server mode, EnvLoop for standard mode
-            use_server_mode = self.config.env.train.get("use_server_mode", False)
-            if use_server_mode:
-                from recipe.vla.env_loop_server import EnvLoopServer
+            from recipe.vla.env_loop import EnvLoop
 
-                logger.info("Using EnvLoopServer for Isaac Server Mode")
-                self.async_rollout_manager = EnvLoopServer(
-                    config=self.config, rollout_wg=self.actor_rollout_wg, env_wg=self.env_wg
-                )
-            else:
-                from recipe.vla.env_loop import EnvLoop
-
-                self.async_rollout_manager = EnvLoop(
-                    config=self.config, rollout_wg=self.actor_rollout_wg, env_wg=self.env_wg
-                )
+            self.async_rollout_manager = EnvLoop(
+                config=self.config, rollout_wg=self.actor_rollout_wg, env_wg=self.env_wg
+            )
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         # pop those keys for generation

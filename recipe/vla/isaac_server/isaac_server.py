@@ -13,22 +13,22 @@
 # limitations under the License.
 
 """
-Isaac Lab Simulation Actor (Ray-based)
+Isaac Lab Simulation Server (Ray-based)
 
 A Ray Actor that runs Isaac Lab multi-task simulation on a single GPU.
-This replaces the ZMQ-based server with Ray's native actor model for:
+Benefits of using Ray servers:
 - Unified resource management by Ray
 - Simplified deployment (no manual server startup)
 - Efficient data transfer via Ray's object store
 
 Architecture:
-    - One IsaacSimActor per GPU
-    - Each Actor handles a subset of tasks (like distributed ZMQ server)
-    - Multiple Actors managed by IsaacSimActorManager (one manager per stage)
+    - One IsaacServer per GPU
+    - Each Server handles a subset of tasks
+    - Multiple Servers managed by IsaacServerManager (one manager per stage)
 
 Usage:
-    # Create actor (Ray will schedule to available GPU)
-    actor = IsaacSimActor.options(num_gpus=1).remote(
+    # Create server (Ray will schedule to available GPU)
+    server = IsaacServer.options(num_gpus=1).remote(
         env_id="Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0",
         num_tasks=5,
         group_size=8,  # Envs per task
@@ -37,10 +37,10 @@ Usage:
     )
 
     # Initialize (must call before step/reset)
-    ray.get(actor.init_env.remote())
+    ray.get(server.init_env.remote())
 
     # Use step/reset
-    result = ray.get(actor.step.remote(actions, env_indices))
+    result = ray.get(server.step.remote(actions, env_indices))
 """
 
 import logging
@@ -50,20 +50,20 @@ from typing import Any, Optional
 import numpy as np
 import ray
 
-logger = logging.getLogger("IsaacSimActor")
+logger = logging.getLogger("IsaacServer")
 
 
-def setup_per_process_caches(actor_rank: int, stage_id: int = 0):
+def setup_per_process_caches(server_rank: int, stage_id: int = 0):
     """Setup per-process cache directories to avoid locking conflicts.
 
-    Same as in server.py - prevents OptiX/shader cache conflicts.
+    Prevents OptiX/shader cache conflicts.
     Must be called BEFORE importing any Isaac/Omniverse modules.
 
-    Important: Each (stage_id, actor_rank) pair needs unique cache directories
-    to avoid conflicts between different stage actors.
+    Important: Each (stage_id, server_rank) pair needs unique cache directories
+    to avoid conflicts between different stage servers.
     """
-    # Use stage_id/actor_rank to create unique cache paths
-    cache_suffix = f"stage_{stage_id}/rank_{actor_rank}"
+    # Use stage_id/server_rank to create unique cache paths
+    cache_suffix = f"stage_{stage_id}/rank_{server_rank}"
 
     # === OptiX Cache ===
     optix_base = "/tmp/optix_cache"  # Don't inherit from env - always use fresh
@@ -89,36 +89,35 @@ def setup_per_process_caches(actor_rank: int, stage_id: int = 0):
     os.environ["CARB_DATA_PATH"] = os.path.join(ov_rank_cache, "carb")  # Carbonite data
 
     # Use print to ensure visibility in Ray logs
-    print(f"[Stage {stage_id} Rank {actor_rank}] Cache directories configured:", flush=True)
+    print(f"[Stage {stage_id} Rank {server_rank}] Cache directories configured:", flush=True)
     print(f"  OptiX:  {optix_rank_cache}", flush=True)
     print(f"  Shader: {shader_rank_cache}", flush=True)
     print(f"  OV Kit: {ov_rank_cache}", flush=True)
 
 
 @ray.remote(num_gpus=1)
-class IsaacSimActor:
+class IsaacServer:
     """
     Ray Actor for Isaac Lab multi-task simulation.
 
-    This is a drop-in replacement for the ZMQ-based IsaacMultiTaskServer,
-    but managed by Ray instead of running as an independent process.
+    Managed by Ray for unified resource management.
 
-    Key differences from ZMQ server:
-    1. No ZMQ socket - uses Ray's actor methods directly
+    Key features:
+    1. Uses Ray's server methods directly
     2. GPU allocated by Ray scheduler (num_gpus=1)
     3. Data transferred via Ray's object store (automatic serialization)
     4. Lifecycle managed by Ray (no manual start/stop)
 
     Thread Safety:
-        Ray actors are single-threaded by default, so all method calls
-        are serialized. This matches the ZMQ REP socket behavior.
+        Ray servers are single-threaded by default, so all method calls
+        are serialized.
     """
 
     def __init__(
         self,
         env_id: str = "Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0",
         num_tasks: int = 5,
-        group_size: int = 8,  # Fixed envs per task (same as ZMQ mode)
+        group_size: int = 8,  # Fixed envs per task
         actor_rank: int = 0,
         task_offset: int = 0,
         render_last_only: bool = True,
@@ -127,14 +126,14 @@ class IsaacSimActor:
         stage_id: int = 0,
     ):
         """
-        Initialize the Isaac Sim Actor.
+        Initialize the Isaac Sim Server.
 
         Args:
             env_id: Gymnasium environment ID for multi-task Isaac env
-            num_tasks: Number of tasks this actor handles
+            num_tasks: Number of tasks this server handles
             group_size: Number of parallel envs per task (fixed for all tasks)
-            actor_rank: Rank of this actor (0 to num_actors-1)
-            task_offset: Global task ID offset for this actor
+            actor_rank: Rank of this server (0 to num_servers-1)
+            task_offset: Global task ID offset for this server
             render_last_only: If True, only render on the last step of action chunks
             camera_height: Camera image height
             camera_width: Camera image width
@@ -150,10 +149,10 @@ class IsaacSimActor:
         self.camera_width = camera_width
         self.stage_id = stage_id
 
-        # Total envs = num_tasks * group_size (same as ZMQ mode)
+        # Total envs = num_tasks * group_size
         self.total_envs = num_tasks * group_size
 
-        # Task ID to env indices mapping (local to this actor)
+        # Task ID to env indices mapping (local to this server)
         # task_id here is LOCAL (0 to num_tasks-1)
         self.task_to_env_indices = {
             task_id: list(range(task_id * group_size, (task_id + 1) * group_size)) for task_id in range(num_tasks)
@@ -167,7 +166,7 @@ class IsaacSimActor:
         self._initialized = False
 
         logger.info(
-            f"[Stage {stage_id} Actor {actor_rank}] Created: "
+            f"[Stage {stage_id} Server {actor_rank}] Created: "
             f"{num_tasks} tasks (offset={task_offset}), "
             f"group_size={group_size}, {self.total_envs} envs"
         )
@@ -177,7 +176,7 @@ class IsaacSimActor:
         Initialize the Isaac Lab environment.
 
         This is separated from __init__ because Isaac Lab initialization
-        requires GPU context which may not be ready during actor creation.
+        requires GPU context which may not be ready during server creation.
 
         Returns:
             dict with status and environment info
@@ -196,7 +195,7 @@ class IsaacSimActor:
         # Setup per-process caches (unique per stage + actor to avoid conflicts)
         setup_per_process_caches(self.actor_rank, self.stage_id)
 
-        # Set environment variables for Isaac Lab config (same as ZMQ mode)
+        # Set environment variables for Isaac Lab config
         # GROUP_SIZE = envs per task (not total envs!)
         os.environ["GROUP_SIZE"] = str(self.group_size)
         os.environ["TASK_OFFSET"] = str(self.task_offset)
@@ -498,7 +497,7 @@ class IsaacSimActor:
             return value.cpu().numpy()
         elif isinstance(value, dict):
             return {k: self._to_cpu_numpy(v) for k, v in value.items()}
-        elif isinstance(value, list | tuple):
+        elif isinstance(value, (list, tuple)):
             return type(value)(self._to_cpu_numpy(v) for v in value)
         elif isinstance(value, np.ndarray):
             return value
