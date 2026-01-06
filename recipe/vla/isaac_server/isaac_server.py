@@ -53,7 +53,7 @@ import ray
 logger = logging.getLogger("IsaacServer")
 
 
-def setup_per_process_caches(server_rank: int, stage_id: int = 0):
+def setup_per_process_caches(server_rank: int, stage_id: int = 0, clear_cache: bool = False):
     """Setup per-process cache directories to avoid locking conflicts.
 
     Prevents OptiX/shader cache conflicts.
@@ -61,38 +61,67 @@ def setup_per_process_caches(server_rank: int, stage_id: int = 0):
 
     Important: Each (stage_id, server_rank) pair needs unique cache directories
     to avoid conflicts between different stage servers.
+
+    Args:
+        server_rank: The rank of this server within a stage.
+        stage_id: The stage ID (for multi-stage training).
+        clear_cache: If True, clear existing cache directories before setup.
+                     This ensures clean state but increases startup time.
     """
+    import shutil
+
     # Use stage_id/server_rank to create unique cache paths
     cache_suffix = f"stage_{stage_id}/rank_{server_rank}"
 
+    def _setup_cache_dir(base_path: str, clear: bool) -> str:
+        """Create cache directory, optionally clearing existing content."""
+        cache_dir = os.path.join(base_path, cache_suffix)
+        if clear and os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
     # === OptiX Cache ===
     optix_base = "/tmp/optix_cache"  # Don't inherit from env - always use fresh
-    optix_rank_cache = os.path.join(optix_base, cache_suffix)
-    os.makedirs(optix_rank_cache, exist_ok=True)
+    optix_rank_cache = _setup_cache_dir(optix_base, clear_cache)
     os.environ["OPTIX_CACHE_PATH"] = optix_rank_cache
     os.environ["OPTIX7_CACHE_PATH"] = optix_rank_cache
 
     # === NVIDIA Driver Shader Cache ===
     shader_base = "/tmp/nv_shader_cache"  # Don't inherit from env
-    shader_rank_cache = os.path.join(shader_base, cache_suffix)
-    os.makedirs(shader_rank_cache, exist_ok=True)
+    shader_rank_cache = _setup_cache_dir(shader_base, clear_cache)
     os.environ["__GL_SHADER_DISK_CACHE"] = "1"
     os.environ["__GL_SHADER_DISK_CACHE_PATH"] = shader_rank_cache
     os.environ["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
 
     # === Omniverse Kit Cache (includes shader cache) ===
     ov_base = "/tmp/ov_cache"  # Don't inherit from env
-    ov_rank_cache = os.path.join(ov_base, cache_suffix)
-    os.makedirs(ov_rank_cache, exist_ok=True)
+    ov_rank_cache = _setup_cache_dir(ov_base, clear_cache)
     os.environ["OMNI_KIT_CACHE_DIR"] = ov_rank_cache
     os.environ["OMNI_USER_CACHE_DIR"] = ov_rank_cache  # Also set user cache
     os.environ["CARB_DATA_PATH"] = os.path.join(ov_rank_cache, "carb")  # Carbonite data
 
+    # === XDG Base Directories ===
+    # Note: Kit in Isaac Sim container uses hardcoded paths (/isaac-sim/kit/data/)
+    # which ignore XDG variables. The kvdb conflict warning is benign - Kit
+    # gracefully disables kvdb when another process holds the lock.
+    # This doesn't affect training or rendering, only settings persistence.
+    xdg_base = "/tmp/xdg_home"
+    xdg_rank_home = _setup_cache_dir(xdg_base, clear_cache)
+    os.environ["XDG_DATA_HOME"] = os.path.join(xdg_rank_home, "data")
+    os.environ["XDG_CONFIG_HOME"] = os.path.join(xdg_rank_home, "config")
+    os.environ["XDG_CACHE_HOME"] = os.path.join(xdg_rank_home, "cache")
+    os.makedirs(os.environ["XDG_DATA_HOME"], exist_ok=True)
+    os.makedirs(os.environ["XDG_CONFIG_HOME"], exist_ok=True)
+    os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
+
     # Use print to ensure visibility in Ray logs
-    print(f"[Stage {stage_id} Rank {server_rank}] Cache directories configured:", flush=True)
+    cleared_msg = " (cleared)" if clear_cache else ""
+    print(f"[Stage {stage_id} Rank {server_rank}] Cache directories configured{cleared_msg}:", flush=True)
     print(f"  OptiX:  {optix_rank_cache}", flush=True)
     print(f"  Shader: {shader_rank_cache}", flush=True)
     print(f"  OV Kit: {ov_rank_cache}", flush=True)
+    print(f"  XDG:    {xdg_rank_home}", flush=True)
 
 
 @ray.remote(num_gpus=1)
@@ -193,7 +222,9 @@ class IsaacServer:
         import torch
 
         # Setup per-process caches (unique per stage + actor to avoid conflicts)
-        setup_per_process_caches(self.actor_rank, self.stage_id)
+        # Set ISAAC_CLEAR_CACHE=1 env var to clear caches on startup (slower but cleaner)
+        clear_cache = os.environ.get("ISAAC_CLEAR_CACHE", "0") == "1"
+        setup_per_process_caches(self.actor_rank, self.stage_id, clear_cache=clear_cache)
 
         # Set environment variables for Isaac Lab config
         # GROUP_SIZE = envs per task (not total envs!)
