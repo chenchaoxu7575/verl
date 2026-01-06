@@ -114,9 +114,9 @@ def main_task(config):
         ray_worker_group_cls = RayWorkerGroup
 
         # Choose EnvWorker based on config
-        use_ray_actors = config.env.train.get("use_ray_actors", False)
+        isaac_server_mode = config.env.train.get("isaac_server_mode", False)
 
-        if use_ray_actors:
+        if isaac_server_mode:
             # Ray actor mode: Isaac Sim runs as Ray actors (recommended)
             from recipe.vla.workers.env import EnvWorkerServer as EnvWorker
 
@@ -152,13 +152,18 @@ def main_task(config):
         # colocated sim and actor rollout
         num_nodes_sim = config.trainer.nnodes
 
-    # In Ray actor mode, EnvWorker is a lightweight client that doesn't need GPUs
-    # The Ray actors manage all simulation GPUs independently
-    if use_ray_actors:
+    # In Isaac server mode, EnvWorker is a lightweight client that doesn't need GPUs
+    # The Isaac servers manage all simulation GPUs independently
+    if isaac_server_mode:
         # Override env_gpu_num - only need 1 worker for coordination, no GPU needed
-        env_gpu_num = config.env.train.get("server_mode_env_workers", 1)
-        logger.info(f"Ray actor mode: using {env_gpu_num} EnvWorker(s) per node (lightweight, no GPU)")
-
+        # Important: Only create 1 EnvWorker total (not per sim node) because:
+        # 1. Each EnvWorker creates its own IsaacServerManager
+        # 2. Ray automatically distributes IsaacServers across all sim nodes
+        # 3. Multiple managers would create duplicate servers (waste resources)
+        env_gpu_num = 1
+        num_nodes_sim = 1  # Force to 1 regardless of actual sim nodes
+        logger.info(f"Isaac server mode: using 1 EnvWorker total (manages servers across {config.env.disagg_sim.nnodes} sim nodes)")
+    
     resource_pool_spec = {
         train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
         "env_gpu_pool": [env_gpu_num] * num_nodes_sim,
@@ -182,7 +187,7 @@ def main_task(config):
     # Create task-balanced sampler for ray actor mode
     # Needed to avoid exceeding per-task env capacity
     train_sampler = None
-    if use_ray_actors:
+    if isaac_server_mode:
         from recipe.vla.workers.env import create_task_balanced_sampler
 
         # Pass env config to sampler for task balancing

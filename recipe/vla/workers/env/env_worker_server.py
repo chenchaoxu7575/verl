@@ -42,7 +42,7 @@ Usage:
     # Or configure in YAML:
     env:
         train:
-            use_ray_actors: true
+            isaac_server_mode: true
 """
 
 import logging
