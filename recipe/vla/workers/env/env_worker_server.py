@@ -164,10 +164,6 @@ class EnvWorkerServer(Worker):
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self.num_envs = self.cfg.train.num_envs
 
-        # total_envs from config (actual envs participating in training)
-        # This may be less than num_tasks * group_size (some envs stay idle)
-        self.total_envs = self.cfg.train.get("total_envs", 128)
-
         # group_size = envs per task (from config)
         num_tasks = config.train.get("num_tasks", 10)
         self.group_size = config.train.get("group_size", 16)
@@ -178,8 +174,9 @@ class EnvWorkerServer(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            # Use rank and world_size from environment (already set by Worker.__init__)
+            rank = self.rank
+            world_size = self.world_size
 
             # Check if we have GPU
             has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
@@ -196,6 +193,18 @@ class EnvWorkerServer(Worker):
                 rank=rank,
                 world_size=world_size,
             )
+        
+        # Note: Worker base class already set self._rank and self._world_size from env vars
+        # We don't override them here - they should match torch.distributed values
+
+        # total_envs from config
+        # In Server mode with single EnvWorkerServer, this is the global total
+        self.total_envs = self.cfg.train.get("total_envs", 128)
+        
+        logger.info(
+            f"[rank={self.rank}] EnvWorkerServer: "
+            f"total_envs={self.total_envs}, world_size={self.world_size}"
+        )
 
         device_name = "cpu" if not torch.cuda.is_available() else get_device_name()
         env_device_mesh = init_device_mesh(device_name, mesh_shape=(self.world_size, 1), mesh_dim_names=["dp", "tp"])
@@ -735,5 +744,6 @@ class EnvWorkerServer(Worker):
     def __del__(self):
         """Clean up - don't close manager if it was provided externally."""
         # Only close if we created the manager ourselves
-        if self.manager and self._external_manager is None:
+        if hasattr(self, 'manager') and self.manager and \
+            hasattr(self, '_external_manager') and self._external_manager is None:
             self.manager.close()

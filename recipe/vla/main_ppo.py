@@ -152,22 +152,23 @@ def main_task(config):
         # colocated sim and actor rollout
         num_nodes_sim = config.trainer.nnodes
 
-    # In Isaac server mode, EnvWorker is a lightweight client that doesn't need GPUs
-    # The Isaac servers manage all simulation GPUs independently
+    # In Isaac server mode, EnvWorker is a lightweight adapter that doesn't need GPUs
+    # The IsaacServerManager manages all simulation GPUs independently
     if isaac_server_mode:
-        # Override env_gpu_num - only need 1 worker for coordination, no GPU needed
-        # Important: Only create 1 EnvWorker total (not per sim node) because:
-        # 1. Each EnvWorker creates its own IsaacServerManager
-        # 2. Ray automatically distributes IsaacServers across all sim nodes
-        # 3. Multiple managers would create duplicate servers (waste resources)
-        env_gpu_num = 1
-        num_nodes_sim = 1  # Force to 1 regardless of actual sim nodes
-        logger.info(f"Isaac server mode: using 1 EnvWorker total (manages servers across {config.env.disagg_sim.nnodes} sim nodes)")
-    
-    resource_pool_spec = {
-        train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
-        "env_gpu_pool": [env_gpu_num] * num_nodes_sim,
-    }
+        # Only need 1 EnvWorkerServer total (not per node)
+        # It's just an adapter between verl framework and IsaacServerManager
+        # IsaacServerManager handles all the parallelism and distribution
+        logger.info("Isaac server mode: using 1 EnvWorkerServer (adapter for IsaacServerManager)")
+        resource_pool_spec = {
+            train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
+            "env_gpu_pool": [1],  # Single EnvWorkerServer
+        }
+    else:
+        # Standard mode: need EnvWorkers on each sim node
+        resource_pool_spec = {
+            train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
+            "env_gpu_pool": [env_gpu_num] * num_nodes_sim,
+        }
     mapping = {
         Role.ActorRollout: train_rollout_pool_id,
         # Role.Critic: global_pool_id,
