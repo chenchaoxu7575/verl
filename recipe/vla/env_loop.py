@@ -50,12 +50,13 @@ class EnvLoop:
         self.action_dim = config.env.actor.model.action_dim
         self.num_action_chunks = config.env.actor.model.num_action_chunks
         # Derived properties
-        # In server/ray mode, total_envs is configured explicitly
+        # In server/ray mode, total_trajs is configured explicitly
         # In local mode, it's computed from world_size * num_envs_per_worker
-        self.total_envs = config.env.train.get("total_envs", self.env_wg.world_size * self.num_envs_per_worker)
-        if self.total_envs % self.stage_num != 0:
-            raise ValueError(f"Total envs ({self.total_envs}) must be divisible by stage_num ({self.stage_num})")
-        self.envs_per_stage = self.total_envs // self.stage_num
+        # Note: total_trajs = trajectories for training, NOT sim envs
+        self.total_trajs = config.env.train.get("total_trajs", self.env_wg.world_size * self.num_envs_per_worker)
+        if self.total_trajs % self.stage_num != 0:
+            raise ValueError(f"Total trajs ({self.total_trajs}) must be divisible by stage_num ({self.stage_num})")
+        self.trajs_per_stage = self.total_trajs // self.stage_num
 
         self.env_wg.init_worker()
         self.env_wg.init_simulator()
@@ -99,16 +100,17 @@ class EnvLoop:
         # --- Pipeline state ---
         trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
         rollout_futures = {}
-        # is_complete = torch.zeros((self.total_envs,), dtype=torch.bool)
+        # is_complete = torch.zeros((self.total_trajs,), dtype=torch.bool)
 
-        # Extract trajectory_keys for each stage (important for action-env mapping)
-        staged_trajectory_keys = {}
+        # Extract traj_keys for each stage (important for action-env mapping)
+        # Each traj_key maps a rollout traj to exactly one sim env
+        staged_traj_keys = {}
         for stage_id in range(self.stage_num):
             stage_data = staged_obs[stage_id]
-            if "trajectory_keys" in stage_data.non_tensor_batch:
-                staged_trajectory_keys[stage_id] = stage_data.non_tensor_batch["trajectory_keys"]
+            if "traj_keys" in stage_data.non_tensor_batch:
+                staged_traj_keys[stage_id] = stage_data.non_tensor_batch["traj_keys"]
             else:
-                staged_trajectory_keys[stage_id] = None
+                staged_traj_keys[stage_id] = None
 
         for stage_id in range(self.stage_num):
             # trajectories[stage_id].append({'obs': staged_obs[stage_id]})
@@ -123,14 +125,18 @@ class EnvLoop:
 
                 trajectories[stage_id][-1]["action"] = action_result
 
-                # Include trajectory_keys to ensure action-env mapping
+                # Include traj_keys to ensure action-env mapping (1:1 traj-env correspondence)
                 non_tensors = {"actions": action_result.batch["action"].cpu().numpy()}
-                if staged_trajectory_keys[stage_id] is not None:
-                    non_tensors["trajectory_keys"] = staged_trajectory_keys[stage_id]
+                if staged_traj_keys[stage_id] is not None:
+                    non_tensors["traj_keys"] = staged_traj_keys[stage_id]
 
                 action_data = DataProto.from_dict(
                     non_tensors=non_tensors,
-                    meta_info={"stage_id": stage_id},
+                    meta_info={
+                        "stage_id": stage_id,
+                        "step_idx": step_idx,
+                        "max_steps": self.max_interactions,
+                    },
                 )
 
                 env_ref = self.env_wg.env_interact_step(action_data)
@@ -164,8 +170,8 @@ class EnvLoop:
         Each trajectory has num_envs_per_worker (e.g., 8) environments.
         We need to de-interleave by stage.
         """
-        # Total trajectories = total_envs / num_envs_per_worker
-        num_trajectories = self.total_envs // self.num_envs_per_worker
+        # Total trajectories = total_trajs / num_envs_per_worker
+        num_trajectories = self.total_trajs // self.num_envs_per_worker
 
         # Chunk data by trajectory (each trajectory = num_envs_per_worker envs)
         trajectory_chunks = data_proto.chunk(num_trajectories)

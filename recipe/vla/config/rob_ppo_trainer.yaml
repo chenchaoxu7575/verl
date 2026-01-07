@@ -56,7 +56,7 @@ env:
     num_tasks: 10
     
     # Envs per task (only for Ray actor mode)
-    # total_envs = num_tasks × group_size
+    # sim_envs_per_stage = num_tasks × group_size
     group_size: 16
     
     # Original env worker count (how many workers would exist in standard mode)
@@ -64,8 +64,9 @@ env:
     # total_stages = original_env_worker_count × pipeline_stage_num
     original_env_worker_count: 8
     
-    # Total environments (for EnvWorkerServer coordination)
-    total_envs: 128
+    # Total trajectories for training (for EnvWorkerServer coordination)
+    # This is the number of trajectories participating in training, NOT sim envs
+    total_trajs: 128
     
     # Environment ID for Isaac Lab
     env_id: "Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"

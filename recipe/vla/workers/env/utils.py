@@ -151,6 +151,10 @@ class TaskBalancedSampler(Sampler):
             - Stage 0: batch[0], batch[2], batch[4], ...
             - Stage 1: batch[1], batch[3], batch[5], ...
 
+        IMPORTANT: This interleaving is tightly coupled with EnvWorkerServer.reset_envs_to_state_ids()
+        in env_worker_server.py, which uses the same round-robin logic (traj_idx % stage_num).
+        If you change the interleaving here, you MUST update reset_envs_to_state_ids() too.
+
         Each stage has its own server group, so we need to ensure each stage's
         portion respects the max_per_task constraint independently.
 

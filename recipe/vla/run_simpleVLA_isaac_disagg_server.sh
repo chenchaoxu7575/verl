@@ -18,12 +18,11 @@ SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$WORKSPACE/data/Openvla-oft-SFT-libero10-traja
 
 # for rollout and train
 NUM_NODES=1
+NUM_ROLLOUT_GPUS_PER_NODE=8
 # for simulator
-SIM_NODES=1
-NUM_ENV_GPUS=8
-NUM_ROLLOUT_GPUS=8
-STAGE_NUM=2
-BATCH_SIZE=16
+SIM_NODES=2
+NUM_ENV_GPUS_TOTAL=10
+BATCH_SIZE=32
 # rollout.n should equal to num_envs for isaac env
 # GROUP_SIZE / ROLLOUT_N = max trajectories per task (need >= 2 for uneven data distribution)
 ROLLOUT_N=8
@@ -32,8 +31,10 @@ ROLLOUT_N=8
 MAX_EPISODE_STEPS=128
 
 # Number of tasks in the benchmark
-# Must satisfy: NUM_TASKS × GROUP_SIZE = NUM_ROLLOUT_GPUS × STAGE_NUM × ROLLOUT_N
+# Must satisfy: NUM_TASKS × GROUP_SIZE =  NUM_ROLLOUT_GPUS_PER_NODE × STAGE_NUM × ROLLOUT_N
 NUM_TASKS=10
+STAGE_NUM=2
+GROUP_SIZE=16
 
 # isaac or libero
 # NOT SUPPORTED: libero means original libero benchmark with mujoco sim
@@ -46,7 +47,7 @@ EXPERIMENT_NAME="${SIM_TYPE}_ray_rl"
 USE_RAY_ACTORS=True
 
 # Number of Isaac servers per stage (one per GPU)
-NUM_ISAAC_SERVERS=$NUM_ENV_GPUS
+NUM_ISAAC_SERVERS=$NUM_ENV_GPUS_TOTAL
 
 # Isaac environment ID
 ISAAC_ENV_ID="Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"
@@ -55,24 +56,20 @@ ISAAC_ENV_ID="Isaac-Libero-Franka-OscPose-Camera-All-Tasks-v0"
 CAMERA_HEIGHT=256
 CAMERA_WIDTH=256
 
-# Group size (envs per task) - configure directly
-# This is the number of parallel environments per task
-GROUP_SIZE=16
-
-# TOTAL_ENVS = environments participating in training (from rollout config)
+# TRAJS_PER_BATCH = environments participating in training (from rollout config)
 # ISAAC_ENVS = total environments in Isaac Sim (may be more, extras stay idle)
-TOTAL_ENVS=$((NUM_ROLLOUT_GPUS * STAGE_NUM * ROLLOUT_N))
-ISAAC_ENVS=$((NUM_TASKS * GROUP_SIZE))
+TRAJS_PER_BATCH=$((BATCH_SIZE * ROLLOUT_N))
+ISAAC_ENVS=$((NUM_TASKS * GROUP_SIZE * STAGE_NUM))
 
 echo "============================================"
 echo "Environment allocation:"
-echo "  Training envs (total_envs): ${TOTAL_ENVS} = ${NUM_ROLLOUT_GPUS} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} rollout_n"
-echo "  Isaac Sim envs: ${ISAAC_ENVS} = ${NUM_TASKS} tasks × ${GROUP_SIZE} group_size"
-if [ $ISAAC_ENVS -lt $TOTAL_ENVS ]; then
-    echo "ERROR: Not enough Isaac envs! Need at least ${TOTAL_ENVS}"
+echo "  Training envs (TRAJS_PER_BATCH): ${TRAJS_PER_BATCH} = ${NUM_ROLLOUT_GPUS_PER_NODE} gpus × ${NUM_NODES} nodes × ${ROLLOUT_N} rollout_n"
+echo "  Isaac Sim envs: ${ISAAC_ENVS} = ${NUM_TASKS} tasks × ${GROUP_SIZE} group_size × ${STAGE_NUM} stages"
+if [ $ISAAC_ENVS -lt $TRAJS_PER_BATCH ]; then
+    echo "ERROR: Not enough Isaac envs! Need at least ${TRAJS_PER_BATCH}"
     exit 1
 fi
-echo "  Idle envs: $((ISAAC_ENVS - TOTAL_ENVS))"
+echo "  Idle envs: $((ISAAC_ENVS - TRAJS_PER_BATCH))"
 echo "============================================"
 
 echo "============================================"
@@ -82,7 +79,7 @@ echo "  Isaac servers per stage: ${NUM_ISAAC_SERVERS}"
 echo "  Pipeline stages: ${STAGE_NUM}"
 echo "  Total servers: $((NUM_ISAAC_SERVERS * STAGE_NUM))"
 echo "  Tasks: ${NUM_TASKS}"
-echo "  Total envs: ${TOTAL_ENVS} (${NUM_ROLLOUT_GPUS} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} envs)"
+echo "  Total envs: ${TRAJS_PER_BATCH} (${NUM_ROLLOUT_GPUS_PER_NODE} gpus × ${STAGE_NUM} stages × ${ROLLOUT_N} envs)"
 echo "  Group size (envs/task): ${GROUP_SIZE}"
 echo "============================================"
 echo ""
@@ -125,7 +122,7 @@ $PYTHON -m recipe.vla.main_ppo \
     env.train.seed=42 \
     env.disagg_sim.enable=True \
     env.disagg_sim.nnodes=$SIM_NODES \
-    env.train.use_ray_actors=$USE_RAY_ACTORS \
+    env.train.isaac_server_mode=$USE_RAY_ACTORS \
     env.train.num_isaac_servers=$NUM_ISAAC_SERVERS \
     env.train.num_tasks=$NUM_TASKS \
     env.train.group_size=$GROUP_SIZE \
@@ -162,11 +159,11 @@ $PYTHON -m recipe.vla.main_ppo \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$OUTPUT_DIR \
-    trainer.n_gpus_per_node=$NUM_ROLLOUT_GPUS \
-    +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
-    +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
+    trainer.n_gpus_per_node=$NUM_ROLLOUT_GPUS_PER_NODE \
+    +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS_TOTAL \
+    +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS_PER_NODE \
     trainer.nnodes=$NUM_NODES \
-    env.train.total_envs=$TOTAL_ENVS \
+    env.train.total_trajs=$TRAJS_PER_BATCH \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=20 \

@@ -197,13 +197,14 @@ class EnvWorkerServer(Worker):
         # Note: Worker base class already set self._rank and self._world_size from env vars
         # We don't override them here - they should match torch.distributed values
 
-        # total_envs from config
+        # total_trajs from config
         # In Server mode with single EnvWorkerServer, this is the global total
-        self.total_envs = self.cfg.train.get("total_envs", 128)
+        # Note: total_trajs = trajectories for training, NOT sim envs
+        self.total_trajs = self.cfg.train.get("total_trajs", 128)
         
         logger.info(
             f"[rank={self.rank}] EnvWorkerServer: "
-            f"total_envs={self.total_envs}, world_size={self.world_size}"
+            f"total_trajs={self.total_trajs}, world_size={self.world_size}"
         )
 
         device_name = "cpu" if not torch.cuda.is_available() else get_device_name()
@@ -213,7 +214,7 @@ class EnvWorkerServer(Worker):
         # Hash-key based env mapping
         self._trajectory_registry: dict[str, dict] = {}
         self._task_allocation_offset: dict[int, int] = {}
-        self._active_trajectory_keys: list[str] = []
+        self._active_traj_keys: list[str] = []
 
         # Video saving
         self.video_cfg = self.cfg.train.get("video_cfg", {})
@@ -225,7 +226,7 @@ class EnvWorkerServer(Worker):
 
         logger.info(f"[rank={self.rank}] EnvWorkerServer initialized")
         logger.info(f"[rank={self.rank}] Using Ray actors")
-        logger.info(f"[rank={self.rank}] Total envs: {self.total_envs}, stages: {self.stage_num}")
+        logger.info(f"[rank={self.rank}] Total trajs: {self.total_trajs}, stages: {self.stage_num}")
 
     def set_server_manager(self, manager: IsaacServerManager):
         """
@@ -282,7 +283,7 @@ class EnvWorkerServer(Worker):
         logger.info(
             f"[rank={self.rank}] Connected to Isaac servers: "
             f"{self.stage_num} stages × {self.num_isaac_servers} servers, "
-            f"{self.manager.num_tasks} tasks, {self.manager._total_envs} total_envs"
+            f"{self.manager.num_tasks} tasks, {self.manager._total_envs} sim_envs_per_stage"
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -301,18 +302,18 @@ class EnvWorkerServer(Worker):
         chunk_actions = data.non_tensor_batch["actions"]
         stage_id: int = data.meta_info["stage_id"]
 
-        trajectory_keys = data.non_tensor_batch.get("trajectory_keys", None)
+        traj_keys = data.non_tensor_batch.get("traj_keys", None)
 
-        if trajectory_keys is not None:
-            self._validate_trajectory_keys(trajectory_keys)
+        if traj_keys is not None:
+            self._validate_traj_keys(traj_keys)
         else:
-            logger.warning(f"[rank={self.rank}] trajectory_keys not provided, using order from reset")
-            # Each stage processes total_envs / stage_num environments
-            envs_per_stage = self.total_envs // self.stage_num
-            stage_start = stage_id * envs_per_stage
-            stage_end = (stage_id + 1) * envs_per_stage
-            trajectory_keys = self._active_trajectory_keys[stage_start:stage_end]
-            self._validate_trajectory_keys(trajectory_keys)
+            logger.warning(f"[rank={self.rank}] traj_keys not provided, using order from reset")
+            # Each stage processes total_trajs / stage_num trajectories
+            trajs_per_stage = self.total_trajs // self.stage_num
+            stage_start = stage_id * trajs_per_stage
+            stage_end = (stage_id + 1) * trajs_per_stage
+            traj_keys = self._active_traj_keys[stage_start:stage_end]
+            self._validate_traj_keys(traj_keys)
 
         # Prepare actions
         chunk_actions = prepare_actions(
@@ -329,7 +330,7 @@ class EnvWorkerServer(Worker):
         max_steps = data.meta_info.get("max_steps", 1)
 
         # Route to stage-specific actors
-        response = self._actor_group_step(chunk_actions, trajectory_keys, stage_id, step_idx, max_steps)
+        response = self._server_group_step(chunk_actions, traj_keys, stage_id, step_idx, max_steps)
 
         if response is None or response.get("status") != "ok":
             raise RuntimeError(f"[rank={self.rank}] Step request failed: {response}")
@@ -348,9 +349,9 @@ class EnvWorkerServer(Worker):
                 for key in final_info.get("episode", {}):
                     env_info_list[key] = final_info["episode"][key][chunk_dones[:, -1]]
 
-        # Generate task_descriptions from trajectory registry
+        # Generate task_descriptions from traj registry
         task_descriptions = []
-        for key in trajectory_keys:
+        for key in traj_keys:
             task_id = self._trajectory_registry[key]["task_id"]
             task_descriptions.append(f"Task {task_id}")
 
@@ -366,60 +367,61 @@ class EnvWorkerServer(Worker):
 
         # Video saving
         if self.save_video:
-            self._collect_video_frames(response, trajectory_keys, stage_id)
+            self._collect_video_frames(response, traj_keys, stage_id)
 
         return env_batch
 
-    def _actor_group_step(
+    def _server_group_step(
         self,
         chunk_actions: np.ndarray,
-        trajectory_keys: list,
+        traj_keys: list,
         stage_id: int,
         step_idx: int = 0,
         max_steps: int = 1,
         render_last_only: bool = True,
     ) -> dict:
         """
-        Execute step on the stage-specific actor group.
+        Execute step on the stage-specific server group.
 
         Uses IsaacServerManager.step_batched() for parallel execution.
+        Each traj_key maps to exactly one sim env.
         """
-        # Group by actor_rank
-        actor_groups = defaultdict(lambda: {"indices": [], "actions": [], "original_positions": []})
+        # Group by server_rank for batched execution
+        server_groups = defaultdict(lambda: {"indices": [], "actions": [], "original_positions": []})
 
-        for i, key in enumerate(trajectory_keys):
+        for i, key in enumerate(traj_keys):
             info = self._trajectory_registry[key]
-            actor_rank = info["actor_rank"]
-            actor_groups[actor_rank]["indices"].append(info["env_index"])
-            actor_groups[actor_rank]["actions"].append(chunk_actions[i])
-            actor_groups[actor_rank]["original_positions"].append(i)
+            server_rank = info["server_rank"]
+            server_groups[server_rank]["indices"].append(info["env_index"])
+            server_groups[server_rank]["actions"].append(chunk_actions[i])
+            server_groups[server_rank]["original_positions"].append(i)
 
         # Log step info
-        actor_summary = {rank: len(group["indices"]) for rank, group in actor_groups.items()}
+        server_summary = {rank: len(group["indices"]) for rank, group in server_groups.items()}
         print(
             f"[EnvWorker Ray] Step {step_idx + 1}/{max_steps} Stage {stage_id}: "
-            f"{len(trajectory_keys)} envs -> {len(actor_groups)} actors {actor_summary}",
+            f"{len(traj_keys)} trajs -> {len(server_groups)} servers {server_summary}",
             flush=True,
         )
 
         # Build batched requests
-        actor_requests = {}
+        server_requests = {}
         position_map = {}
-        for rank, group in actor_groups.items():
+        for rank, group in server_groups.items():
             actions = np.array(group["actions"])
             indices = group["indices"]
-            actor_requests[rank] = (actions, indices)
+            server_requests[rank] = (actions, indices)
             position_map[rank] = group["original_positions"]
 
         # Send requests via manager
-        responses = self.manager.step_batched(actor_requests, stage_id=stage_id, render_last_only=render_last_only)
+        responses = self.manager.step_batched(server_requests, stage_id=stage_id, render_last_only=render_last_only)
 
         # Validate responses
         all_responses = {}
         for rank, response in responses.items():
             if response is None or response.get("status") != "ok":
                 raise RuntimeError(
-                    f"[rank={self.rank}] Step request to stage {stage_id} actor {rank} failed: {response}"
+                    f"[rank={self.rank}] Step request to stage {stage_id} server {rank} failed: {response}"
                 )
             all_responses[rank] = {
                 "response": response,
@@ -427,7 +429,7 @@ class EnvWorkerServer(Worker):
             }
 
         # Aggregate responses
-        return self._aggregate_responses(all_responses, len(trajectory_keys))
+        return self._aggregate_responses(all_responses, len(traj_keys))
 
     def _aggregate_responses(self, all_responses: dict, num_envs: int) -> dict:
         """Aggregate responses from multiple actors into a single response."""
@@ -483,14 +485,14 @@ class EnvWorkerServer(Worker):
             "infos": {},
         }
 
-    def _validate_trajectory_keys(self, trajectory_keys: list[str]) -> None:
-        """Validate that all trajectory_keys exist in the registry."""
-        invalid_keys = [key for key in trajectory_keys if key not in self._trajectory_registry]
+    def _validate_traj_keys(self, traj_keys: list[str]) -> None:
+        """Validate that all traj_keys exist in the registry."""
+        invalid_keys = [key for key in traj_keys if key not in self._trajectory_registry]
 
         if invalid_keys:
             suffix = "..." if len(invalid_keys) > 5 else ""
             raise RuntimeError(
-                f"[rank={self.rank}] Invalid trajectory_keys: {invalid_keys[:5]}{suffix}. "
+                f"[rank={self.rank}] Invalid traj_keys: {invalid_keys[:5]}{suffix}. "
                 f"Valid keys: {list(self._trajectory_registry.keys())[:5]}..."
             )
 
@@ -504,144 +506,173 @@ class EnvWorkerServer(Worker):
         """
         Reset environments to specified state IDs (task IDs).
 
-        Uses IsaacServerManager for batched reset across all stages.
+        Each stage is completely isolated and reset independently.
+        
+        Key concept: Each traj (rollout) maps to exactly one sim env via a unique traj_key.
+        This 1:1 mapping allows flexible env deployment on sim side.
+        
+        Stage assignment: traj_idx % stage_num determines which stage handles each traj.
+        
+        IMPORTANT: This stage assignment logic is tightly coupled with TaskBalancedSampler
+        in utils.py, which uses the same round-robin interleaving:
+            - Stage 0: batch[0], batch[2], batch[4], ... (traj_idx % stage_num == 0)
+            - Stage 1: batch[1], batch[3], batch[5], ... (traj_idx % stage_num == 1)
+        If you change the stage assignment here, you MUST update TaskBalancedSampler too.
         """
         state_ids_list = list(data.non_tensor_batch["state_ids"])
         task_ids_list = list(data.non_tensor_batch["task_ids"])
 
-        logger.debug(
-            f"[rank={self.rank}] reset_envs_to_state_ids: {len(state_ids_list)} envs, "
-            f"unique_tasks={len(set(task_ids_list))}"
-        )
+        # Each sample in batch = one traj = one sim env
+        num_trajs = len(state_ids_list)
+        assert num_trajs == len(task_ids_list), "state_ids and task_ids must have same length"
+        assert num_trajs <= self.total_trajs, f"num_trajs={num_trajs} exceeds total_trajs={self.total_trajs}"
 
-        expected_count = self.total_envs
-        assert len(state_ids_list) == expected_count, (
-            f"[rank={self.rank}] Expected {expected_count} state_ids, got {len(state_ids_list)}"
+        logger.debug(
+            f"[rank={self.rank}] reset_envs_to_state_ids: {num_trajs} trajs, "
+            f"unique_tasks={len(set(task_ids_list))}"
         )
 
         # Clear previous mappings
         self._trajectory_registry.clear()
         self._task_allocation_offset.clear()
-        self._active_trajectory_keys.clear()
+        self._active_traj_keys.clear()
 
-        trajectory_keys = []
-        num_trajectories = self.total_envs // self.num_envs
+        # ============================================================
+        # Step 1: Group trajs by stage (each stage is isolated)
+        # ============================================================
+        # Stage assignment uses round-robin: traj_idx % stage_num
+        # This MUST match TaskBalancedSampler's interleaving in utils.py
+        # stage_trajs[stage_id] = list of (traj_idx, task_id) for that stage
+        stage_trajs = {stage_id: [] for stage_id in range(self.stage_num)}
+        for traj_idx in range(num_trajs):
+            stage_id = traj_idx % self.stage_num  # Coupled with TaskBalancedSampler
+            task_id = task_ids_list[traj_idx]
+            stage_trajs[stage_id].append((traj_idx, task_id))
 
-        # Group by actor_rank for batched reset
-        actor_env_groups = defaultdict(lambda: {"env_indices": [], "traj_indices": []})
-        traj_to_actor = {}
+        # ============================================================
+        # Step 2: For each stage, allocate envs and build reset requests
+        # ============================================================
+        # Per-stage data structures
+        stage_traj_keys = {stage_id: [] for stage_id in range(self.stage_num)}
+        stage_server_groups = {
+            stage_id: defaultdict(lambda: {"env_indices": [], "traj_indices": []})
+            for stage_id in range(self.stage_num)
+        }
+        # Track task allocation offset per stage (each stage has its own pool)
+        stage_task_offsets = {stage_id: {} for stage_id in range(self.stage_num)}
 
-        for traj_idx in range(num_trajectories):
-            traj_start = traj_idx * self.num_envs
-            traj_end = (traj_idx + 1) * self.num_envs
-            traj_task_ids = task_ids_list[traj_start:traj_end]
+        for stage_id in range(self.stage_num):
+            for traj_idx, task_id in stage_trajs[stage_id]:
+                # Get server that handles this task
+                server_rank = self.manager.get_server_for_task(task_id)
 
-            unique_task_ids = set(traj_task_ids)
-            if len(unique_task_ids) != 1:
-                raise RuntimeError(f"[rank={self.rank}] Trajectory {traj_idx} has mixed task_ids: {unique_task_ids}")
+                # Get available env indices for this task on that server
+                task_env_indices = self.manager.get_env_indices_for_task(task_id)
+                pool_size = len(task_env_indices)
 
-            task_id = traj_task_ids[0]
+                # Sequential allocation within this stage's pool
+                offset = stage_task_offsets[stage_id].get(task_id, 0)
+                if offset >= pool_size:
+                    raise RuntimeError(
+                        f"[rank={self.rank}] Stage {stage_id} Task {task_id} pool exhausted: "
+                        f"pool_size={pool_size}, already allocated={offset}"
+                    )
 
-            # Get actor's env_indices for this task
-            task_env_indices = self.manager.get_env_indices_for_task(task_id)
-            group_size = len(task_env_indices)
+                env_idx = task_env_indices[offset]
+                stage_task_offsets[stage_id][task_id] = offset + 1
 
-            # Get which actor handles this task
-            actor_rank = self.manager.get_server_for_task(task_id)
-
-            # Sequential allocation within each task's env pool
-            offset = self._task_allocation_offset.get(task_id, 0)
-
-            if offset + self.num_envs > group_size:
-                raise RuntimeError(
-                    f"[rank={self.rank}] Task {task_id} has only {group_size} envs, but need {offset + self.num_envs}"
-                )
-
-            env_indices = task_env_indices[offset : offset + self.num_envs]
-            self._task_allocation_offset[task_id] = offset + self.num_envs
-
-            # Generate unique hash_key for each env
-            traj_env_keys = []
-            for i, env_idx in enumerate(env_indices):
-                env_key = str(uuid.uuid4())[:8]
-                self._trajectory_registry[env_key] = {
+                # Generate unique traj_key for this traj-env pair
+                traj_key = str(uuid.uuid4())[:8]
+                self._trajectory_registry[traj_key] = {
                     "env_index": env_idx,
                     "task_id": task_id,
                     "traj_idx": traj_idx,
-                    "actor_rank": actor_rank,  # Changed from server_rank
+                    "stage_id": stage_id,
+                    "server_rank": server_rank,
                 }
-                traj_env_keys.append(env_key)
+                stage_traj_keys[stage_id].append((traj_idx, traj_key))
 
-            trajectory_keys.extend(traj_env_keys)
+                # Group by server for batched reset
+                stage_server_groups[stage_id][server_rank]["env_indices"].append(env_idx)
+                stage_server_groups[stage_id][server_rank]["traj_indices"].append(traj_idx)
 
-            # Group env_indices by actor for batched reset
-            actor_env_groups[actor_rank]["env_indices"].extend(env_indices)
-            actor_env_groups[actor_rank]["traj_indices"].append(traj_idx)
-            traj_to_actor[traj_idx] = actor_rank
-
-            logger.info(
-                f"[rank={self.rank}] Traj {traj_idx}: task_id={task_id}, actor_rank={actor_rank}, "
-                f"env_indices [{env_indices[0]}-{env_indices[-1]}]"
+        # ============================================================
+        # Step 3: Reset each stage independently
+        # ============================================================
+        stage_responses = {}
+        for stage_id in range(self.stage_num):
+            server_groups = stage_server_groups[stage_id]
+            server_requests = {rank: group["env_indices"] for rank, group in server_groups.items()}
+            
+            trajs_in_stage = len(stage_trajs[stage_id])
+            print(
+                f"[EnvWorker Ray] Stage {stage_id} Reset: {trajs_in_stage} trajs -> "
+                f"{len(server_requests)} server(s)",
+                flush=True,
             )
 
-        # Batched reset - reset all stages
-        print(
-            f"[EnvWorker Ray] Batched Reset: {num_trajectories} trajectories -> "
-            f"{len(actor_env_groups)} actor(s) x {self.stage_num} stages",
-            flush=True,
-        )
+            # Reset this stage
+            responses = self.manager.reset_batched(server_requests, stage_id=stage_id, stabilize=True)
 
-        actor_requests = {rank: group["env_indices"] for rank, group in actor_env_groups.items()}
-
-        # Reset all stages using manager
-        actor_responses_per_stage = self.manager.reset_all_stages_batched(actor_requests, stabilize=True)
-
-        # Validate responses
-        for stage_id, stage_responses in actor_responses_per_stage.items():
-            for rank, response in stage_responses.items():
+            # Validate responses
+            for rank, response in responses.items():
                 if response.get("status") != "ok":
-                    raise RuntimeError(f"[rank={self.rank}] Reset to stage {stage_id} actor {rank} failed: {response}")
+                    raise RuntimeError(f"[rank={self.rank}] Reset stage {stage_id} server {rank} failed: {response}")
 
-        # Reconstruct result_list in trajectory order
-        actor_positions_per_stage = {
-            stage_id: {rank: 0 for rank in actor_env_groups.keys()} for stage_id in range(self.stage_num)
+            stage_responses[stage_id] = responses
+
+        # ============================================================
+        # Step 4: Collect observations in traj order
+        # ============================================================
+        # Track position in each server's response for each stage
+        stage_server_positions = {
+            stage_id: {rank: 0 for rank in stage_server_groups[stage_id].keys()}
+            for stage_id in range(self.stage_num)
         }
-        result_list = []
 
-        for traj_idx in range(num_trajectories):
-            stage_id = traj_idx % self.stage_num
-            actor_rank = traj_to_actor[traj_idx]
-            obs = actor_responses_per_stage[stage_id][actor_rank]["obs"]
-            pos = actor_positions_per_stage[stage_id][actor_rank]
+        # Build traj_keys list and obs_list in traj order
+        traj_keys = [None] * num_trajs
+        obs_list = [None] * num_trajs
 
-            # Extract this trajectory's observations
-            traj_obs = {}
-            for key, value in obs.items():
-                if isinstance(value, np.ndarray):
-                    traj_obs[key] = value[pos : pos + self.num_envs]
-                elif isinstance(value, dict):
-                    traj_obs[key] = {}
-                    for k2, v2 in value.items():
-                        if isinstance(v2, np.ndarray):
-                            traj_obs[key][k2] = v2[pos : pos + self.num_envs]
-                        else:
-                            traj_obs[key][k2] = v2
-                else:
-                    traj_obs[key] = value
+        for stage_id in range(self.stage_num):
+            for traj_idx, traj_key in stage_traj_keys[stage_id]:
+                info = self._trajectory_registry[traj_key]
+                server_rank = info["server_rank"]
+                
+                server_obs = stage_responses[stage_id][server_rank]["obs"]
+                pos = stage_server_positions[stage_id][server_rank]
 
-            result_list.append(traj_obs)
-            actor_positions_per_stage[stage_id][actor_rank] += self.num_envs
+                # Extract single env's observation
+                traj_obs = {}
+                for key, value in server_obs.items():
+                    if isinstance(value, np.ndarray):
+                        traj_obs[key] = value[pos : pos + 1]  # Single env
+                    elif isinstance(value, dict):
+                        traj_obs[key] = {}
+                        for k2, v2 in value.items():
+                            if isinstance(v2, np.ndarray):
+                                traj_obs[key][k2] = v2[pos : pos + 1]
+                            else:
+                                traj_obs[key][k2] = v2
+                    else:
+                        traj_obs[key] = value
+
+                traj_keys[traj_idx] = traj_key
+                obs_list[traj_idx] = traj_obs
+                stage_server_positions[stage_id][server_rank] += 1
 
         # Store active keys
-        self._active_trajectory_keys = trajectory_keys
+        self._active_traj_keys = traj_keys
 
-        logger.info(f"[rank={self.rank}] Reset complete: {len(trajectory_keys)} env keys registered")
+        logger.info(f"[rank={self.rank}] Reset complete: {len(traj_keys)} traj-env pairs registered")
 
-        # Build output DataProto
+        # ============================================================
+        # Step 5: Build output DataProto
+        # ============================================================
         output_tensor_dict = {}
         output_non_tensor_dict = {}
 
-        images_and_states_list = [extract_images_and_states(obs) for obs in result_list]
+        images_and_states_list = [extract_images_and_states(obs) for obs in obs_list]
         if images_and_states_list and images_and_states_list[0]:
             for k in images_and_states_list[0].keys():
                 if isinstance(images_and_states_list[0][k], np.ndarray):
@@ -649,23 +680,22 @@ class EnvWorkerServer(Worker):
                         np.concatenate([obs[k] for obs in images_and_states_list], axis=0)
                     )
 
-        # Task descriptions
+        # Task descriptions - one per traj
         task_descriptions = []
-        for traj_idx, obs in enumerate(result_list):
-            if "task_descriptions" in obs:
-                task_descriptions.extend(obs["task_descriptions"])
+        for traj_idx, obs in enumerate(obs_list):
+            if "task_descriptions" in obs and obs["task_descriptions"]:
+                task_descriptions.append(obs["task_descriptions"][0])
             else:
-                env_key = trajectory_keys[traj_idx * self.num_envs]
-                task_id = self._trajectory_registry[env_key]["task_id"]
-                task_descriptions.extend([f"Task {task_id}"] * self.num_envs)
+                task_id = self._trajectory_registry[traj_keys[traj_idx]]["task_id"]
+                task_descriptions.append(f"Task {task_id}")
         output_non_tensor_dict["task_descriptions"] = task_descriptions
 
-        output_non_tensor_dict["trajectory_keys"] = trajectory_keys
+        output_non_tensor_dict["traj_keys"] = traj_keys
 
         output = DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
         return output
 
-    def _collect_video_frames(self, response, trajectory_keys, stage_id):
+    def _collect_video_frames(self, response, traj_keys, stage_id):
         """Collect images for video saving - organized by stage and task_id."""
         images_and_states = extract_images_and_states(response["obs"])
         if "full_image" not in images_and_states:
@@ -675,8 +705,8 @@ class EnvWorkerServer(Worker):
             self.camera_view = images_and_states["camera_name"]
 
         full_images = images_and_states["full_image"]
-        rewards = response.get("rewards", np.zeros(len(trajectory_keys)))
-        terminations = response.get("terminations", np.zeros(len(trajectory_keys)))
+        rewards = response.get("rewards", np.zeros(len(traj_keys)))
+        terminations = response.get("terminations", np.zeros(len(traj_keys)))
 
         if stage_id not in self.render_images:
             self.render_images[stage_id] = {}
@@ -684,7 +714,7 @@ class EnvWorkerServer(Worker):
 
         # Group images by task_id
         task_id_to_images = {}
-        for i, key in enumerate(trajectory_keys):
+        for i, key in enumerate(traj_keys):
             task_id = self._trajectory_registry[key]["task_id"]
             img = full_images[i]
 
