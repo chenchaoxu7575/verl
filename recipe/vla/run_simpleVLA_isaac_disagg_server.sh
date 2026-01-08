@@ -95,7 +95,7 @@ fi
 # avoiding warnings
 mkdir -p /root/LIBERO/libero/libero/../datasets
 
-SAVE_VIDEO=True
+SAVE_VIDEO=False
 
 export PYTHONRECURSIONLIMIT=10000
 # uncomment this to see full error messages
@@ -168,7 +168,7 @@ $PYTHON -m recipe.vla.main_ppo \
     trainer.test_freq=-1 \
     trainer.total_epochs=20 \
     trainer.val_only=False \
-    trainer.total_training_steps=3 \
+    trainer.total_training_steps=1000 \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
