@@ -528,7 +528,7 @@ class IsaacServer:
             return value.cpu().numpy()
         elif isinstance(value, dict):
             return {k: self._to_cpu_numpy(v) for k, v in value.items()}
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             return type(value)(self._to_cpu_numpy(v) for v in value)
         elif isinstance(value, np.ndarray):
             return value

@@ -156,7 +156,8 @@ class IsaacServerManager:
 
         logger.info(
             f"IsaacServerManager created: "
-            f"{num_stages} stages × {num_servers_per_stage} servers = {num_stages * num_servers_per_stage} total servers, "
+            f"{num_stages} stages × {num_servers_per_stage} servers = "
+            f"{num_stages * num_servers_per_stage} total servers, "
             f"{num_tasks} tasks × {group_size} group_size = {self._total_envs} total_envs"
         )
         if self.remainder_tasks > 0:
@@ -270,8 +271,8 @@ class IsaacServerManager:
             logger.error(f"Server initialization error: {e}")
             return False
 
-        # Verify total envs
-        first_server_info = ray.get(self.servers[0][0].get_task_mapping.remote())
+        # Verify servers are ready
+        _ = ray.get(self.servers[0][0].get_task_mapping.remote())
 
         self._initialized = True
         logger.info(

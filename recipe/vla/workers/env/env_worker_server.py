@@ -165,7 +165,6 @@ class EnvWorkerServer(Worker):
         self.num_envs = self.cfg.train.num_envs
 
         # group_size = envs per task (from config)
-        num_tasks = config.train.get("num_tasks", 10)
         self.group_size = config.train.get("group_size", 16)
 
         # Initialize distributed
@@ -193,7 +192,7 @@ class EnvWorkerServer(Worker):
                 rank=rank,
                 world_size=world_size,
             )
-        
+
         # Note: Worker base class already set self._rank and self._world_size from env vars
         # We don't override them here - they should match torch.distributed values
 
@@ -201,11 +200,8 @@ class EnvWorkerServer(Worker):
         # In Server mode with single EnvWorkerServer, this is the global total
         # Note: total_trajs = trajectories for training, NOT sim envs
         self.total_trajs = self.cfg.train.get("total_trajs", 128)
-        
-        logger.info(
-            f"[rank={self.rank}] EnvWorkerServer: "
-            f"total_trajs={self.total_trajs}, world_size={self.world_size}"
-        )
+
+        logger.info(f"[rank={self.rank}] EnvWorkerServer: total_trajs={self.total_trajs}, world_size={self.world_size}")
 
         device_name = "cpu" if not torch.cuda.is_available() else get_device_name()
         env_device_mesh = init_device_mesh(device_name, mesh_shape=(self.world_size, 1), mesh_dim_names=["dp", "tp"])
@@ -507,12 +503,12 @@ class EnvWorkerServer(Worker):
         Reset environments to specified state IDs (task IDs).
 
         Each stage is completely isolated and reset independently.
-        
+
         Key concept: Each traj (rollout) maps to exactly one sim env via a unique traj_key.
         This 1:1 mapping allows flexible env deployment on sim side.
-        
+
         Stage assignment: traj_idx % stage_num determines which stage handles each traj.
-        
+
         IMPORTANT: This stage assignment logic is tightly coupled with TaskBalancedSampler
         in utils.py, which uses the same round-robin interleaving:
             - Stage 0: batch[0], batch[2], batch[4], ... (traj_idx % stage_num == 0)
@@ -528,8 +524,7 @@ class EnvWorkerServer(Worker):
         assert num_trajs <= self.total_trajs, f"num_trajs={num_trajs} exceeds total_trajs={self.total_trajs}"
 
         logger.debug(
-            f"[rank={self.rank}] reset_envs_to_state_ids: {num_trajs} trajs, "
-            f"unique_tasks={len(set(task_ids_list))}"
+            f"[rank={self.rank}] reset_envs_to_state_ids: {num_trajs} trajs, unique_tasks={len(set(task_ids_list))}"
         )
 
         # Clear previous mappings
@@ -555,8 +550,7 @@ class EnvWorkerServer(Worker):
         # Per-stage data structures
         stage_traj_keys = {stage_id: [] for stage_id in range(self.stage_num)}
         stage_server_groups = {
-            stage_id: defaultdict(lambda: {"env_indices": [], "traj_indices": []})
-            for stage_id in range(self.stage_num)
+            stage_id: defaultdict(lambda: {"env_indices": [], "traj_indices": []}) for stage_id in range(self.stage_num)
         }
         # Track task allocation offset per stage (each stage has its own pool)
         stage_task_offsets = {stage_id: {} for stage_id in range(self.stage_num)}
@@ -603,11 +597,10 @@ class EnvWorkerServer(Worker):
         for stage_id in range(self.stage_num):
             server_groups = stage_server_groups[stage_id]
             server_requests = {rank: group["env_indices"] for rank, group in server_groups.items()}
-            
+
             trajs_in_stage = len(stage_trajs[stage_id])
             print(
-                f"[EnvWorker Ray] Stage {stage_id} Reset: {trajs_in_stage} trajs -> "
-                f"{len(server_requests)} server(s)",
+                f"[EnvWorker Ray] Stage {stage_id} Reset: {trajs_in_stage} trajs -> {len(server_requests)} server(s)",
                 flush=True,
             )
 
@@ -626,8 +619,7 @@ class EnvWorkerServer(Worker):
         # ============================================================
         # Track position in each server's response for each stage
         stage_server_positions = {
-            stage_id: {rank: 0 for rank in stage_server_groups[stage_id].keys()}
-            for stage_id in range(self.stage_num)
+            stage_id: {rank: 0 for rank in stage_server_groups[stage_id].keys()} for stage_id in range(self.stage_num)
         }
 
         # Build traj_keys list and obs_list in traj order
@@ -638,7 +630,7 @@ class EnvWorkerServer(Worker):
             for traj_idx, traj_key in stage_traj_keys[stage_id]:
                 info = self._trajectory_registry[traj_key]
                 server_rank = info["server_rank"]
-                
+
                 server_obs = stage_responses[stage_id][server_rank]["obs"]
                 pos = stage_server_positions[stage_id][server_rank]
 
@@ -774,6 +766,10 @@ class EnvWorkerServer(Worker):
     def __del__(self):
         """Clean up - don't close manager if it was provided externally."""
         # Only close if we created the manager ourselves
-        if hasattr(self, 'manager') and self.manager and \
-            hasattr(self, '_external_manager') and self._external_manager is None:
+        if (
+            hasattr(self, "manager")
+            and self.manager
+            and hasattr(self, "_external_manager")
+            and self._external_manager is None
+        ):
             self.manager.close()
